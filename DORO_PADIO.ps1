@@ -355,11 +355,11 @@ function Remove-ArchiveGroup {
 function Get-ArchiveListing {
     param(
         [Parameter(Mandatory)][string]$ArchivePath,
-        [Parameter(Mandatory)][string]$Pwd
+        [Parameter(Mandatory)][string]$ArchiveKey
     )
 
     try {
-        $raw = & $SevenZipExe l "-p$Pwd" -slt -- $ArchivePath 2>&1
+        $raw = & $SevenZipExe l "-p$ArchiveKey" -slt -- $ArchivePath 2>&1
         if ($LASTEXITCODE -ne 0) {
             Write-Host "  [WARN] 无法预读压缩包结构: $(Split-Path -Leaf $ArchivePath)" -ForegroundColor Yellow
             return $null
@@ -486,10 +486,10 @@ function Invoke-7zExtract {
     param(
         [Parameter(Mandatory)][string]$ArchivePath,
         [Parameter(Mandatory)][string]$TargetDir,
-        [Parameter(Mandatory)][string]$Pwd
+        [Parameter(Mandatory)][string]$ArchiveKey
     )
 
-    & $SevenZipExe x "-p$Pwd" -aot -y "-o$TargetDir" -- $ArchivePath | Out-Host
+    & $SevenZipExe x "-p$ArchiveKey" -aot -y "-o$TargetDir" -- $ArchivePath | Out-Host
     return ($LASTEXITCODE -eq 0)
 }
 
@@ -497,12 +497,12 @@ function Invoke-WinRARExtract {
     param(
         [Parameter(Mandatory)][string]$ArchivePath,
         [Parameter(Mandatory)][string]$TargetDir,
-        [Parameter(Mandatory)][string]$Pwd
+        [Parameter(Mandatory)][string]$ArchiveKey
     )
 
     $proc = Start-Process -FilePath $WinRarExe -ArgumentList @(
         'x',
-        "-p$Pwd",
+        "-p$ArchiveKey",
         '-ibck',
         '-y',
         '-or',
@@ -517,14 +517,14 @@ function Invoke-PreparedExtraction {
     param(
         [Parameter(Mandatory)][pscustomobject]$Entry,
         [Parameter(Mandatory)][string]$TargetDir,
-        [Parameter(Mandatory)][string]$Pwd,
+        [Parameter(Mandatory)][string]$ArchiveKey,
         [Parameter(Mandatory)][ValidateSet('7z', 'WinRAR')][string]$Tool,
         [Parameter(Mandatory)][ValidateSet('Isolated', 'Flat')][string]$TargetMode,
         [object[]]$Listing = $null
     )
 
     if ($null -eq $Listing) {
-        $Listing = Get-ArchiveListing -ArchivePath $Entry.Path -Pwd $Pwd
+        $Listing = Get-ArchiveListing -ArchivePath $Entry.Path -ArchiveKey $ArchiveKey
     }
 
     try {
@@ -550,9 +550,9 @@ function Invoke-PreparedExtraction {
 
         Write-Host "[EXTRACT] ($(Get-EntryLabel -Entry $Entry)) $(Split-Path -Leaf $Entry.Path) -> $actualTarget" -ForegroundColor Yellow
         $success = if ($Tool -eq 'WinRAR') {
-            Invoke-WinRARExtract -ArchivePath $Entry.Path -TargetDir $actualTarget -Pwd $Pwd
+            Invoke-WinRARExtract -ArchivePath $Entry.Path -TargetDir $actualTarget -ArchiveKey $ArchiveKey
         } else {
-            Invoke-7zExtract -ArchivePath $Entry.Path -TargetDir $actualTarget -Pwd $Pwd
+            Invoke-7zExtract -ArchivePath $Entry.Path -TargetDir $actualTarget -ArchiveKey $ArchiveKey
         }
 
         return [pscustomobject]@{
@@ -572,21 +572,21 @@ function Expand-ArchiveSmartFinal {
     param(
         [Parameter(Mandatory)][pscustomobject]$Entry,
         [Parameter(Mandatory)][string]$OutputDir,
-        [Parameter(Mandatory)][string]$Pwd
+        [Parameter(Mandatory)][string]$ArchiveKey
     )
 
-    $listing = Get-ArchiveListing -ArchivePath $Entry.Path -Pwd $Pwd
+    $listing = Get-ArchiveListing -ArchivePath $Entry.Path -ArchiveKey $ArchiveKey
     $hasRootFolder = Test-ArchiveHasRootFolderFromListing -Listing $listing
 
     if ($hasRootFolder) {
         Write-Host "  [SMART] 根目录含文件夹，直接解压到 output" -ForegroundColor DarkGray
-        return Invoke-PreparedExtraction -Entry $Entry -TargetDir $OutputDir -Pwd $Pwd -Tool '7z' -TargetMode 'Flat' -Listing $listing
+        return Invoke-PreparedExtraction -Entry $Entry -TargetDir $OutputDir -ArchiveKey $ArchiveKey -Tool '7z' -TargetMode 'Flat' -Listing $listing
     }
 
     $folderName = Get-SafeFolderName -Name $Entry.Base
     $target = Join-Path $OutputDir $folderName
     Write-Host "  [SMART] 根目录无文件夹，解压到同名目录: $folderName" -ForegroundColor DarkGray
-    return Invoke-PreparedExtraction -Entry $Entry -TargetDir $target -Pwd $Pwd -Tool '7z' -TargetMode 'Isolated' -Listing $listing
+    return Invoke-PreparedExtraction -Entry $Entry -TargetDir $target -ArchiveKey $ArchiveKey -Tool '7z' -TargetMode 'Isolated' -Listing $listing
 }
 
 # ==================== 管线处理 ====================
@@ -601,8 +601,8 @@ function Convert-ClassifiedMp4ToZip {
         })
 
     foreach ($file in $mp4Files) {
-        $profile = Get-ProfileForName -BaseName $file.BaseName
-        if ($null -eq $profile) {
+        $archiveProfile = Get-ProfileForName -BaseName $file.BaseName
+        if ($null -eq $archiveProfile) {
             Write-Host "[SKIP] 无法分类 MP4: $($file.Name)" -ForegroundColor DarkGray
             continue
         }
@@ -612,7 +612,7 @@ function Convert-ClassifiedMp4ToZip {
 
         try {
             Rename-Item -LiteralPath $file.FullName -NewName (Split-Path -Leaf $zipPath) -ErrorAction Stop
-            Write-Host "[RENAME] $($file.Name) -> $(Split-Path -Leaf $zipPath) [$($profile.Display)]" -ForegroundColor Green
+            Write-Host "[RENAME] $($file.Name) -> $(Split-Path -Leaf $zipPath) [$($archiveProfile.Display)]" -ForegroundColor Green
         } catch {
             Write-Host "[ERROR] MP4 重命名失败: $($file.Name) - $_" -ForegroundColor Red
         }
@@ -622,26 +622,26 @@ function Convert-ClassifiedMp4ToZip {
 function Invoke-InitialStage {
     param(
         [Parameter(Mandatory)][pscustomobject]$Entry,
-        [Parameter(Mandatory)][pscustomobject]$Profile
+        [Parameter(Mandatory)][pscustomobject]$ArchiveProfile
     )
 
     $targetName = Get-SafeFolderName -Name $Entry.Base
     $targetDir = Join-Path $Output0 $targetName
-    $result = Invoke-PreparedExtraction -Entry $Entry -TargetDir $targetDir -Pwd $Profile.Password -Tool 'WinRAR' -TargetMode 'Isolated'
+    $result = Invoke-PreparedExtraction -Entry $Entry -TargetDir $targetDir -ArchiveKey $ArchiveProfile.Password -Tool 'WinRAR' -TargetMode 'Isolated'
 
     if ($result.Success) {
-        Write-Host "  [OK] 第一层完成 [$($Profile.Display)]" -ForegroundColor Green
+        Write-Host "  [OK] 第一层完成 [$($ArchiveProfile.Display)]" -ForegroundColor Green
         if ($DeleteFlag) {
             [void](Remove-ArchiveGroup -Entry $Entry)
             Write-Host "  [DELETE] 已删除源压缩包" -ForegroundColor DarkGray
         }
     } else {
-        Write-Host "  [FAIL] 第一层失败 [$($Profile.Display)]" -ForegroundColor Red
+        Write-Host "  [FAIL] 第一层失败 [$($ArchiveProfile.Display)]" -ForegroundColor Red
     }
 
     return [pscustomobject]@{
         Success   = $result.Success
-        Profile   = $Profile
+        Profile   = $ArchiveProfile
         Source    = $Entry
         Stage0Dir = $result.TargetDir
         Name      = $targetName
@@ -652,7 +652,7 @@ function Invoke-IntermediateLayer {
     param(
         [Parameter(Mandatory)][string]$SourceDir,
         [Parameter(Mandatory)][string]$TargetRoot,
-        [Parameter(Mandatory)][pscustomobject]$Profile,
+        [Parameter(Mandatory)][pscustomobject]$ArchiveProfile,
         [Parameter(Mandatory)][string]$LayerName
     )
 
@@ -671,7 +671,7 @@ function Invoke-IntermediateLayer {
             Join-Path $TargetRoot $archiveFolder
         }
 
-        $result = Invoke-PreparedExtraction -Entry $entry -TargetDir $targetDir -Pwd $Profile.Password -Tool '7z' -TargetMode 'Isolated'
+        $result = Invoke-PreparedExtraction -Entry $entry -TargetDir $targetDir -ArchiveKey $ArchiveProfile.Password -Tool '7z' -TargetMode 'Isolated'
         if ($result.Success) {
             Write-Host "  [OK] $LayerName 完成" -ForegroundColor Green
             if ($DeleteFlag) {
@@ -687,7 +687,7 @@ function Invoke-IntermediateLayer {
 function Invoke-FinalLayer {
     param(
         [Parameter(Mandatory)][string]$SourceDir,
-        [Parameter(Mandatory)][pscustomobject]$Profile,
+        [Parameter(Mandatory)][pscustomobject]$ArchiveProfile,
         [Parameter(Mandatory)][string]$LayerName
     )
 
@@ -698,7 +698,7 @@ function Invoke-FinalLayer {
     }
 
     foreach ($entry in $entries) {
-        $result = Expand-ArchiveSmartFinal -Entry $entry -OutputDir $Output -Pwd $Profile.Password
+        $result = Expand-ArchiveSmartFinal -Entry $entry -OutputDir $Output -ArchiveKey $ArchiveProfile.Password
         if ($result.Success) {
             Write-Host "  [OK] $LayerName 完成" -ForegroundColor Green
             if ($DeleteFlag) {
@@ -757,7 +757,9 @@ function Remove-EmptyDirs {
             try {
                 Remove-Item -LiteralPath $dir.FullName -Force -ErrorAction Stop
                 $count++
-            } catch { }
+            } catch {
+                Write-Verbose "删除空文件夹失败: $($dir.FullName) - $_"
+            }
         }
     }
 
@@ -821,14 +823,14 @@ if ($initialEntries.Count -eq 0) {
     Write-Host "未发现可处理的初始压缩包" -ForegroundColor Gray
 } else {
     foreach ($entry in $initialEntries) {
-        $profile = Get-ProfileForName -BaseName $entry.Base
-        if ($null -eq $profile) {
+        $archiveProfile = Get-ProfileForName -BaseName $entry.Base
+        if ($null -eq $archiveProfile) {
             Write-Host "[SKIP] 无法分类: $(Split-Path -Leaf $entry.Path)" -ForegroundColor DarkGray
             continue
         }
 
-        Write-Host "[CLASSIFY] $(Split-Path -Leaf $entry.Path) -> $($profile.Display), $($profile.Depth) 层" -ForegroundColor Cyan
-        $job = Invoke-InitialStage -Entry $entry -Profile $profile
+        Write-Host "[CLASSIFY] $(Split-Path -Leaf $entry.Path) -> $($archiveProfile.Display), $($archiveProfile.Depth) 层" -ForegroundColor Cyan
+        $job = Invoke-InitialStage -Entry $entry -ArchiveProfile $archiveProfile
         $jobs.Add($job) | Out-Null
         Write-Host ""
     }
@@ -841,13 +843,13 @@ Write-Host "----------------------------------------"
 foreach ($job in $successfulJobs) {
     if ($job.Profile.Key -eq 'PADIO') {
         Write-Host "[PADIO] $($job.Name): output0\$($job.Name) -> output (smart)" -ForegroundColor Cyan
-        Invoke-FinalLayer -SourceDir $job.Stage0Dir -Profile $job.Profile -LayerName "PADIO 最终层"
+        Invoke-FinalLayer -SourceDir $job.Stage0Dir -ArchiveProfile $job.Profile -LayerName "PADIO 最终层"
         Write-Host ""
     } elseif ($job.Profile.Key -eq 'DORO') {
         $targetRoot = Join-Path $Output1 $job.Name
         New-DirectoryIfMissing -Path $targetRoot
         Write-Host "[DORO] $($job.Name): output0\$($job.Name) -> output1\$($job.Name)\<压缩包名>" -ForegroundColor Cyan
-        Invoke-IntermediateLayer -SourceDir $job.Stage0Dir -TargetRoot $targetRoot -Profile $job.Profile -LayerName "DORO 中间层"
+        Invoke-IntermediateLayer -SourceDir $job.Stage0Dir -TargetRoot $targetRoot -ArchiveProfile $job.Profile -LayerName "DORO 中间层"
         Write-Host ""
     }
 }
@@ -865,7 +867,7 @@ if ($doroJobs.Count -eq 0) {
             continue
         }
         Write-Host "[DORO] $($job.Name): output1\$($job.Name) -> output (smart)" -ForegroundColor Cyan
-        Invoke-FinalLayer -SourceDir $sourceDir -Profile $job.Profile -LayerName "DORO 最终层"
+        Invoke-FinalLayer -SourceDir $sourceDir -ArchiveProfile $job.Profile -LayerName "DORO 最终层"
         Write-Host ""
     }
 }
