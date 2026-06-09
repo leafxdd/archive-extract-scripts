@@ -67,6 +67,8 @@ The pipeline depth and smart-extract behaviour varies by script:
 
 **Intermediate directory isolation** (`DORO_PADIO.ps1`): intermediate extractions never flatten into `output0/` or `output1/`. Stage 0 extracts to `output0/<entry-name>/`; the DORO middle layer extracts each archive to `output1/<entry-name>/<archive-name>/`. The final layer is the only layer that uses smart extract into `output/`.
 
+**Resume behaviour** (`DORO_PADIO.ps1`): if a prior run completed stage 0 and then failed later, reruns scan existing `output0/<entry-name>/` directories with archive entrypoints and resume them as stage-0 jobs. This prevents the user from needing to restore already-deleted source `.zip` files after a failed stage 2/3 run.
+
 **Conflict handling** (`DORO_PADIO.ps1`): every extraction goes through a preflight wrapper. Existing isolated target directories get a `__2`, `__3`, ... suffix; final smart-extract conflicts in `output/` rename the existing top-level file or folder to `__existing_2`, `__existing_3`, ... before extraction. 7z uses `-aot` and WinRAR uses `-or` as a second guard against accidental overwrite.
 
 **Multi-pass extraction** (`Process-Archives`): loops up to 10 passes so that archives nested inside archives are fully expanded without manual intervention.
