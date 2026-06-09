@@ -63,6 +63,8 @@ The pipeline depth and smart-extract behaviour varies by script:
 
 **DORO/PADIO classifier** (`DORO_PADIO.ps1`): initial files are classified before extraction. Names containing `doro` use password `doro` and the three-stage DORO pipeline. Four-digit base names such as `1772.mp4` use password `PADIO294` and the two-stage PADIO pipeline. Unknown names open an arrow-key menu so the user can choose DORO, PADIO, or Skip; manual choices made before `.mp4` → `.zip` are cached for the renamed archive so the script does not ask twice.
 
+**Steganographier MP4 disguise**: ordinary SteganographierGUI `mp4` output is cover-video bytes followed by appended ZIP data, so stage 0 must use WinRAR after `.mp4` → `.zip`. Do not use 7z listing or extraction as a preflight for stage 0; 7z can fail to read these disguised inputs even though WinRAR can extract them.
+
 **Intermediate directory isolation** (`DORO_PADIO.ps1`): intermediate extractions never flatten into `output0/` or `output1/`. Stage 0 extracts to `output0/<entry-name>/`; the DORO middle layer extracts each archive to `output1/<entry-name>/<archive-name>/`. The final layer is the only layer that uses smart extract into `output/`.
 
 **Conflict handling** (`DORO_PADIO.ps1`): every extraction goes through a preflight wrapper. Existing isolated target directories get a `__2`, `__3`, ... suffix; final smart-extract conflicts in `output/` rename the existing top-level file or folder to `__existing_2`, `__existing_3`, ... before extraction. 7z uses `-aot` and WinRAR uses `-or` as a second guard against accidental overwrite.
