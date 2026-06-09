@@ -555,6 +555,7 @@ function Get-ArchiveListing {
             if (-not $entryPath) { continue }
             if ($entryPath -eq $archiveLeaf) { continue }
             if ([System.IO.Path]::IsPathRooted($entryPath)) {
+                if ((Split-Path -Leaf $entryPath) -eq $archiveLeaf) { continue }
                 if ((Get-NormalizedPath -Path $entryPath) -ieq $archiveFull) { continue }
             }
             $filteredEntries += $entry
@@ -808,10 +809,6 @@ function Invoke-InitialStage {
 
     if ($result.Success) {
         Write-Host "  [OK] 第一层完成 [$($ArchiveProfile.Display)]" -ForegroundColor Green
-        if ($DeleteFlag) {
-            [void](Remove-ArchiveGroup -Entry $Entry)
-            Write-Host "  [DELETE] 已删除源压缩包" -ForegroundColor DarkGray
-        }
     } else {
         Write-Host "  [FAIL] 第一层失败 [$($ArchiveProfile.Display)]" -ForegroundColor Red
     }
@@ -822,6 +819,7 @@ function Invoke-InitialStage {
         Source    = $Entry
         Stage0Dir = $result.TargetDir
         Name      = $targetName
+        CleanupEntries = if ($result.Success) { @($Entry) } else { @() }
     }
 }
 
@@ -836,9 +834,17 @@ function Invoke-IntermediateLayer {
     $entries = @(Get-ArchiveEntrypoints -RootDir $SourceDir)
     if ($entries.Count -eq 0) {
         Write-Host "[$LayerName] 未发现可解压的压缩包" -ForegroundColor Gray
-        return
+        return [pscustomobject]@{
+            Success = $false
+            Entries = @()
+            FailedEntries = @()
+            SourceDir = $SourceDir
+            TargetRoot = $TargetRoot
+        }
     }
 
+    $processedEntries = @()
+    $failedEntries = @()
     foreach ($entry in $entries) {
         $relDir = Get-RelativeDirectory -RootDir $SourceDir -ChildDir $entry.Dir
         $archiveFolder = Get-SafeFolderName -Name $entry.Base
@@ -849,15 +855,21 @@ function Invoke-IntermediateLayer {
         }
 
         $result = Invoke-PreparedExtraction -Entry $entry -TargetDir $targetDir -ArchiveKey $ArchiveProfile.Password -Tool '7z' -TargetMode 'Isolated'
+        $processedEntries += $entry
         if ($result.Success) {
             Write-Host "  [OK] $LayerName 完成" -ForegroundColor Green
-            if ($DeleteFlag) {
-                [void](Remove-ArchiveGroup -Entry $entry)
-                Write-Host "  [DELETE] 已删除中间压缩包" -ForegroundColor DarkGray
-            }
         } else {
+            $failedEntries += $entry
             Write-Host "  [FAIL] $LayerName 失败" -ForegroundColor Red
         }
+    }
+
+    return [pscustomobject]@{
+        Success = ($processedEntries.Count -gt 0 -and $failedEntries.Count -eq 0)
+        Entries = @($processedEntries)
+        FailedEntries = @($failedEntries)
+        SourceDir = $SourceDir
+        TargetRoot = $TargetRoot
     }
 }
 
@@ -871,20 +883,32 @@ function Invoke-FinalLayer {
     $entries = @(Get-ArchiveEntrypoints -RootDir $SourceDir)
     if ($entries.Count -eq 0) {
         Write-Host "[$LayerName] 未发现可解压的压缩包" -ForegroundColor Gray
-        return
+        return [pscustomobject]@{
+            Success = $false
+            Entries = @()
+            FailedEntries = @()
+            SourceDir = $SourceDir
+        }
     }
 
+    $processedEntries = @()
+    $failedEntries = @()
     foreach ($entry in $entries) {
         $result = Expand-ArchiveSmartFinal -Entry $entry -OutputDir $Output -ArchiveKey $ArchiveProfile.Password
+        $processedEntries += $entry
         if ($result.Success) {
             Write-Host "  [OK] $LayerName 完成" -ForegroundColor Green
-            if ($DeleteFlag) {
-                [void](Remove-ArchiveGroup -Entry $entry)
-                Write-Host "  [DELETE] 已删除最终层源压缩包" -ForegroundColor DarkGray
-            }
         } else {
+            $failedEntries += $entry
             Write-Host "  [FAIL] $LayerName 失败" -ForegroundColor Red
         }
+    }
+
+    return [pscustomobject]@{
+        Success = ($processedEntries.Count -gt 0 -and $failedEntries.Count -eq 0)
+        Entries = @($processedEntries)
+        FailedEntries = @($failedEntries)
+        SourceDir = $SourceDir
     }
 }
 
@@ -927,6 +951,51 @@ function Get-ResumableStage0Jobs {
     }
 
     return @($resumedJobs)
+}
+
+function Get-ArchiveEntryCleanupKey {
+    param([Parameter(Mandatory)][pscustomobject]$Entry)
+
+    return "{0}|{1}" -f $Entry.Type, (Get-NormalizedPath -Path $Entry.Path)
+}
+
+function Invoke-CompletedChainCleanup {
+    param([object[]]$Chains)
+
+    if (-not $DeleteFlag) {
+        Write-Host "跳过链路源文件清理（KeepFiles 已启用）" -ForegroundColor Gray
+        return
+    }
+
+    $completedChains = @($Chains | Where-Object { $_.Success })
+    if ($completedChains.Count -eq 0) {
+        Write-Host "没有完整成功的链路需要清理" -ForegroundColor Gray
+        return
+    }
+
+    Write-Host "`n清理完整成功的解压链..." -ForegroundColor Yellow
+    Write-Host "----------------------------------------"
+
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    $deletedCount = 0
+    foreach ($chain in $completedChains) {
+        $entries = @($chain.CleanupEntries | Where-Object { $null -ne $_ })
+        if ($entries.Count -eq 0) { continue }
+
+        Write-Host "[CHAIN OK] $($chain.Name) -> 清理 $($entries.Count) 个压缩包入口" -ForegroundColor Green
+        foreach ($entry in $entries) {
+            $key = Get-ArchiveEntryCleanupKey -Entry $entry
+            if (-not $seen.Add($key)) { continue }
+
+            $leaf = Split-Path -Leaf $entry.Path
+            if (Remove-ArchiveGroup -Entry $entry) {
+                Write-Host "  [DELETE] $leaf" -ForegroundColor DarkGray
+                $deletedCount++
+            }
+        }
+    }
+
+    Write-Host "  [OK] 已清理 $deletedCount 个链路压缩包入口" -ForegroundColor Green
 }
 
 function Remove-JunkFiles {
@@ -1063,42 +1132,92 @@ if ($resumedJobs.Count -gt 0) {
 
 Write-Host "`n步骤 2: PADIO 最终层 / DORO 中间层" -ForegroundColor Yellow
 Write-Host "----------------------------------------"
+$chainResults = @()
 foreach ($job in $successfulJobs) {
+    $cleanupEntries = @($job.CleanupEntries | Where-Object { $null -ne $_ })
+    $chain = [pscustomobject]@{
+        Name           = $job.Name
+        Profile        = $job.Profile
+        Job            = $job
+        Success        = $false
+        Stage2Success  = $false
+        FailedStage    = ""
+        Stage1Dir      = $null
+        CleanupEntries = @($cleanupEntries)
+    }
+
     if ($job.Profile.Key -eq 'PADIO') {
         Write-Host "[PADIO] $($job.Name): output0\$($job.Name) -> output (smart)" -ForegroundColor Cyan
-        Invoke-FinalLayer -SourceDir $job.Stage0Dir -ArchiveProfile $job.Profile -LayerName "PADIO 最终层"
+        $finalResult = Invoke-FinalLayer -SourceDir $job.Stage0Dir -ArchiveProfile $job.Profile -LayerName "PADIO 最终层"
+        $chain.CleanupEntries = @($chain.CleanupEntries + $finalResult.Entries)
+        $chain.Success = [bool]$finalResult.Success
+        if (-not $chain.Success) { $chain.FailedStage = "PADIO 最终层" }
+        if ($chain.Success) {
+            Write-Host "[CHAIN OK] $($job.Name)" -ForegroundColor Green
+        } else {
+            Write-Host "[CHAIN FAIL] $($job.Name): $($chain.FailedStage)" -ForegroundColor Red
+        }
         Write-Host ""
     } elseif ($job.Profile.Key -eq 'DORO') {
         $targetRoot = Join-Path $Output1 $job.Name
         New-DirectoryIfMissing -Path $targetRoot
         Write-Host "[DORO] $($job.Name): output0\$($job.Name) -> output1\$($job.Name)\<压缩包名>" -ForegroundColor Cyan
-        Invoke-IntermediateLayer -SourceDir $job.Stage0Dir -TargetRoot $targetRoot -ArchiveProfile $job.Profile -LayerName "DORO 中间层"
+        $middleResult = Invoke-IntermediateLayer -SourceDir $job.Stage0Dir -TargetRoot $targetRoot -ArchiveProfile $job.Profile -LayerName "DORO 中间层"
+        $chain.CleanupEntries = @($chain.CleanupEntries + $middleResult.Entries)
+        $chain.Stage2Success = [bool]$middleResult.Success
+        $chain.Stage1Dir = $targetRoot
+        if (-not $chain.Stage2Success) { $chain.FailedStage = "DORO 中间层" }
         Write-Host ""
     }
+
+    $chainResults += $chain
 }
 
 Write-Host "`n步骤 3: DORO 最终层" -ForegroundColor Yellow
 Write-Host "----------------------------------------"
-$doroJobs = @($successfulJobs | Where-Object { $_.Profile.Key -eq 'DORO' })
-if ($doroJobs.Count -eq 0) {
+$doroChains = @($chainResults | Where-Object { $_.Profile.Key -eq 'DORO' })
+if ($doroChains.Count -eq 0) {
     Write-Host "没有 DORO 任务需要第三层解压" -ForegroundColor Gray
 } else {
-    foreach ($job in $doroJobs) {
-        $sourceDir = Join-Path $Output1 $job.Name
+    foreach ($chain in $doroChains) {
+        $job = $chain.Job
+        if (-not $chain.Stage2Success) {
+            Write-Host "[SKIP] DORO 最终层跳过: $($job.Name)（中间层未完整成功）" -ForegroundColor Yellow
+            Write-Host "[CHAIN FAIL] $($job.Name): $($chain.FailedStage)" -ForegroundColor Red
+            continue
+        }
+
+        $sourceDir = $chain.Stage1Dir
         if (-not (Test-Path -LiteralPath $sourceDir)) {
             Write-Host "[SKIP] DORO 中间目录不存在: $sourceDir" -ForegroundColor Yellow
+            $chain.FailedStage = "DORO 最终层"
+            Write-Host "[CHAIN FAIL] $($job.Name): $($chain.FailedStage)" -ForegroundColor Red
             continue
         }
         Write-Host "[DORO] $($job.Name): output1\$($job.Name) -> output (smart)" -ForegroundColor Cyan
-        Invoke-FinalLayer -SourceDir $sourceDir -ArchiveProfile $job.Profile -LayerName "DORO 最终层"
+        $finalResult = Invoke-FinalLayer -SourceDir $sourceDir -ArchiveProfile $job.Profile -LayerName "DORO 最终层"
+        $chain.CleanupEntries = @($chain.CleanupEntries + $finalResult.Entries)
+        $chain.Success = [bool]$finalResult.Success
+        if (-not $chain.Success) { $chain.FailedStage = "DORO 最终层" }
+        if ($chain.Success) {
+            Write-Host "[CHAIN OK] $($job.Name)" -ForegroundColor Green
+        } else {
+            Write-Host "[CHAIN FAIL] $($job.Name): $($chain.FailedStage)" -ForegroundColor Red
+        }
         Write-Host ""
     }
 }
 
-Remove-JunkFiles -Jobs $successfulJobs
+$completedJobs = @($chainResults | Where-Object { $_.Success } | ForEach-Object { $_.Job })
 
 if ($DeleteFlag) {
-    Write-Host "`n清理中间目录和空文件夹..." -ForegroundColor Yellow
+    Invoke-CompletedChainCleanup -Chains $chainResults
+}
+
+Remove-JunkFiles -Jobs $completedJobs
+
+if ($DeleteFlag) {
+    Write-Host "`n清点空文件夹..." -ForegroundColor Yellow
     Write-Host "----------------------------------------"
     Remove-IntermediateDirsIfEmpty
     Remove-EmptyDirs -Root $WorkDir -ProtectDirs @($Output)
