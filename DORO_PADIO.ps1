@@ -212,7 +212,7 @@ function Get-ArchiveEntrypoints {
     $allFiles = @(Get-ChildItem -LiteralPath $RootDir -Recurse -File -Force -ErrorAction SilentlyContinue)
     if ($allFiles.Count -eq 0) { return @() }
 
-    $entries = New-Object System.Collections.Generic.List[object]
+    $entries = @()
     $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
 
     foreach ($file in $allFiles) {
@@ -234,7 +234,7 @@ function Get-ArchiveEntrypoints {
                 [void][int]::TryParse($Matches.part, [ref]$partNum)
                 if ($partNum -ne 1) { continue }
                 if ($seen.Add($full)) {
-                    $entries.Add([pscustomobject]@{ Path = $full; Type = 'rar-part'; Dir = $file.DirectoryName; Base = $Matches.stem }) | Out-Null
+                    $entries += [pscustomobject]@{ Path = $full; Type = 'rar-part'; Dir = $file.DirectoryName; Base = $Matches.stem }
                 }
                 continue
             }
@@ -242,7 +242,7 @@ function Get-ArchiveEntrypoints {
             $r00 = Join-Path $file.DirectoryName ($file.BaseName + '.r00')
             $type = if (Test-Path -LiteralPath $r00) { 'rar-r00' } else { 'rar' }
             if ($seen.Add($full)) {
-                $entries.Add([pscustomobject]@{ Path = $full; Type = $type; Dir = $file.DirectoryName; Base = $file.BaseName }) | Out-Null
+                $entries += [pscustomobject]@{ Path = $full; Type = $type; Dir = $file.DirectoryName; Base = $file.BaseName }
             }
             continue
         }
@@ -255,7 +255,7 @@ function Get-ArchiveEntrypoints {
             }
             $type = if ($isZipSplitZ) { 'zip-z' } else { $file.Extension.TrimStart('.') }
             if ($seen.Add($full)) {
-                $entries.Add([pscustomobject]@{ Path = $full; Type = $type; Dir = $file.DirectoryName; Base = $file.BaseName }) | Out-Null
+                $entries += [pscustomobject]@{ Path = $full; Type = $type; Dir = $file.DirectoryName; Base = $file.BaseName }
             }
             continue
         }
@@ -267,7 +267,7 @@ function Get-ArchiveEntrypoints {
             $fmt = $Matches.fmt.ToLowerInvariant()
             $type = "$fmt-001"
             if ($seen.Add($full)) {
-                $entries.Add([pscustomobject]@{ Path = $full; Type = $type; Dir = $file.DirectoryName; Base = $Matches.stem }) | Out-Null
+                $entries += [pscustomobject]@{ Path = $full; Type = $type; Dir = $file.DirectoryName; Base = $Matches.stem }
             }
             continue
         }
@@ -279,11 +279,11 @@ function Get-ArchiveEntrypoints {
             $zipCandidate = Join-Path $file.DirectoryName ($Matches.stem + '.zip')
             if (Test-Path -LiteralPath $zipCandidate) {
                 if ($seen.Add($zipCandidate)) {
-                    $entries.Add([pscustomobject]@{ Path = $zipCandidate; Type = 'zip-z'; Dir = $file.DirectoryName; Base = $Matches.stem }) | Out-Null
+                    $entries += [pscustomobject]@{ Path = $zipCandidate; Type = 'zip-z'; Dir = $file.DirectoryName; Base = $Matches.stem }
                 }
             } else {
                 if ($seen.Add($full)) {
-                    $entries.Add([pscustomobject]@{ Path = $full; Type = 'zip-z01'; Dir = $file.DirectoryName; Base = $Matches.stem }) | Out-Null
+                    $entries += [pscustomobject]@{ Path = $full; Type = 'zip-z01'; Dir = $file.DirectoryName; Base = $Matches.stem }
                 }
             }
             continue
@@ -365,12 +365,12 @@ function Get-ArchiveListing {
             return $null
         }
 
-        $entries = New-Object System.Collections.Generic.List[object]
+        $entries = @()
         $current = @{}
         foreach ($line in $raw) {
             if ($line -match '^Path = (.*)$') {
                 if ($current.ContainsKey('Path')) {
-                    $entries.Add([pscustomobject]$current) | Out-Null
+                    $entries += [pscustomobject]$current
                 }
                 $current = @{ Path = $matches[1] }
             } elseif ($line -match '^Folder = (.*)$') {
@@ -380,7 +380,7 @@ function Get-ArchiveListing {
             }
         }
         if ($current.ContainsKey('Path')) {
-            $entries.Add([pscustomobject]$current) | Out-Null
+            $entries += [pscustomobject]$current
         }
 
         $archiveLeaf = Split-Path $ArchivePath -Leaf
@@ -442,7 +442,7 @@ function Get-ArchiveTopLevelNames {
     param([Parameter(Mandatory)][object[]]$Listing)
 
     $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
-    $names = New-Object System.Collections.Generic.List[string]
+    $names = @()
 
     foreach ($entry in $Listing) {
         $rel = ([string]$entry.Path).TrimStart('\', '/').TrimEnd('\', '/')
@@ -458,7 +458,7 @@ function Get-ArchiveTopLevelNames {
         }
 
         if ($seen.Add($top)) {
-            $names.Add($top) | Out-Null
+            $names += $top
         }
     }
 
@@ -817,7 +817,7 @@ Convert-ClassifiedMp4ToZip -ExcludeDirs $excludeDirs
 Write-Host "`n步骤 1: 初始入口 -> output0\<入口名>" -ForegroundColor Yellow
 Write-Host "----------------------------------------"
 $initialEntries = @(Get-ArchiveEntrypoints -RootDir $WorkDir -ExcludeDirs $excludeDirs)
-$jobs = New-Object System.Collections.Generic.List[object]
+$jobs = @()
 
 if ($initialEntries.Count -eq 0) {
     Write-Host "未发现可处理的初始压缩包" -ForegroundColor Gray
@@ -831,7 +831,7 @@ if ($initialEntries.Count -eq 0) {
 
         Write-Host "[CLASSIFY] $(Split-Path -Leaf $entry.Path) -> $($archiveProfile.Display), $($archiveProfile.Depth) 层" -ForegroundColor Cyan
         $job = Invoke-InitialStage -Entry $entry -ArchiveProfile $archiveProfile
-        $jobs.Add($job) | Out-Null
+        $jobs += $job
         Write-Host ""
     }
 }
