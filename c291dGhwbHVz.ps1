@@ -1,9 +1,14 @@
 ﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
-    c291dGhwbHVz 压缩包处理脚本 - PowerShell版
+    c291dGhwbHVz 压缩包处理脚本（全 WinRAR 版）
 .DESCRIPTION
-    查找并解压 .zip / .z01 / .7z / .7z.001 到 output，保持相对路径结构
+    查找并解压 .zip / .z01 / .7z / .7z.001 / .rar / 各类分卷到 output，保持相对路径结构。
+    单层管线：每个入口先解到隔离临时目录（带解压校验），成功后再并入 output\<相对路径>\，
+    冲突自动改名，绝不覆盖；只有该入口解压成功后才删除其源文件。
+.NOTES
+    全部解压均使用 WinRAR，不再依赖 7-Zip。
+    退出码 0 但未解出任何内容（头加密 7z 遇错误密码的典型表现）一律按失败处理，避免误删。
 #>
 
 param(
@@ -11,7 +16,6 @@ param(
     [string]$Password = "c291dGhwbHVz",
     [switch]$KeepFiles = $false
 )
-
 
 # 规范化 WorkDir（避免通配符/相对路径导致的 Get-ChildItem 过滤异常）
 try {
@@ -22,238 +26,362 @@ try {
     exit 1
 }
 
-# ==================== 初始化设置 ====================
+# ==================== 初始化 ====================
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $OutputEncoding = [System.Text.Encoding]::UTF8
 $PSDefaultParameterValues['*:Encoding'] = 'utf8'
 
-# 工具路径
-$7zExe = Join-Path $env:ProgramFiles "7-Zip-Zstandard\7z.exe"
-
-# 输出目录
+$WinRarExe = Join-Path $env:ProgramFiles "WinRAR\WinRAR.exe"
+$DeleteFlag = -not $KeepFiles
 $Output = Join-Path $WorkDir "output"
 
-# 删除标志（与KeepFiles相反）
-$DeleteFlag = -not $KeepFiles
-
-
-# ==================== 路径安全辅助函数（处理 [] 等通配符字符） ====================
-function Ensure-Directory {
-    param([Parameter(Mandatory=$true)][string]$Path)
-
-    if (Test-Path -LiteralPath $Path) {
-        # 已存在但不是目录
-        if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
-            throw "路径已存在但不是文件夹，无法作为输出目录使用: $Path"
-        }
-        return
-    }
-
-    try {
-        # 使用 .NET 直接创建目录，避免 PowerShell 通配符解析（尤其是 [] 等字符）
+# ==================== 基础工具函数 ====================
+function New-DirectoryIfMissing {
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) {
         [System.IO.Directory]::CreateDirectory($Path) | Out-Null
-    } catch {
-        throw "无法创建目录: $Path`n$($_.Exception.Message)"
     }
 }
 
+function Get-NormalizedPath {
+    param([Parameter(Mandatory)][string]$Path)
+    try { return ([System.IO.Path]::GetFullPath($Path)).TrimEnd('\', '/') }
+    catch { return $Path.TrimEnd('\', '/') }
+}
 
-# ==================== 工具检查 ====================
+function Test-IsUnderPath {
+    param(
+        [Parameter(Mandatory)][string]$ChildPath,
+        [Parameter(Mandatory)][string]$ParentPath
+    )
+    $child = Get-NormalizedPath $ChildPath
+    $parent = Get-NormalizedPath $ParentPath
+    return ($child -ieq $parent) -or ($child.StartsWith($parent + '\', [System.StringComparison]::OrdinalIgnoreCase))
+}
+
+function Get-RelativeDirectory {
+    param(
+        [Parameter(Mandatory)][string]$RootDir,
+        [Parameter(Mandatory)][string]$ChildDir
+    )
+    $root = Get-NormalizedPath $RootDir
+    $child = Get-NormalizedPath $ChildDir
+    if ($child -ieq $root) { return "" }
+    if ($child.StartsWith($root + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+        return $child.Substring($root.Length + 1).Trim('\')
+    }
+    return ""
+}
+
+function Get-SafeFolderName {
+    param([Parameter(Mandatory)][string]$Name)
+    $safe = $Name -replace '[<>:"/\\|?*\x00-\x1F]', '_'
+    $safe = $safe.Trim().TrimEnd('.', ' ')
+    if ([string]::IsNullOrWhiteSpace($safe)) { return "archive" }
+    return $safe
+}
+
+function Get-UniqueDirectoryPath {
+    param([Parameter(Mandatory)][string]$DirectoryPath)
+    if (-not (Test-Path -LiteralPath $DirectoryPath)) { return $DirectoryPath }
+    $item = Get-Item -LiteralPath $DirectoryPath -Force -ErrorAction SilentlyContinue
+    if ($item -is [System.IO.DirectoryInfo]) {
+        $children = @(Get-ChildItem -LiteralPath $DirectoryPath -Force -ErrorAction SilentlyContinue)
+        if ($children.Count -eq 0) { return $DirectoryPath }
+    }
+    $parent = Split-Path -Parent $DirectoryPath
+    $leaf = Split-Path -Leaf $DirectoryPath
+    for ($i = 2; $i -lt 10000; $i++) {
+        $candidate = Join-Path $parent ("{0}__{1}" -f $leaf, $i)
+        if (-not (Test-Path -LiteralPath $candidate)) { return $candidate }
+    }
+    throw "无法为目录生成唯一名称: $DirectoryPath"
+}
+
+function Move-ExistingPathAside {
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    $parent = if ($item -is [System.IO.DirectoryInfo]) { $item.Parent.FullName } else { $item.DirectoryName }
+    $leaf = $item.Name
+    $stem = if ($item -is [System.IO.DirectoryInfo]) { $leaf } else { [System.IO.Path]::GetFileNameWithoutExtension($leaf) }
+    $ext = if ($item -is [System.IO.DirectoryInfo]) { "" } else { [System.IO.Path]::GetExtension($leaf) }
+    for ($i = 2; $i -lt 10000; $i++) {
+        $newLeaf = if ($item -is [System.IO.DirectoryInfo]) { "{0}__existing_{1}" -f $stem, $i } else { "{0}__existing_{1}{2}" -f $stem, $i, $ext }
+        $candidate = Join-Path $parent $newLeaf
+        if (-not (Test-Path -LiteralPath $candidate)) {
+            Move-Item -LiteralPath $item.FullName -Destination $candidate -ErrorAction Stop
+            Write-Host "  [RENAME] 目标冲突，已改名: $leaf -> $newLeaf" -ForegroundColor Yellow
+            return $candidate
+        }
+    }
+    throw "无法为冲突项生成唯一名称: $Path"
+}
+
+function Get-EntryLabel {
+    param([Parameter(Mandatory)][pscustomobject]$Entry)
+    switch ($Entry.Type) {
+        'zip-z'    { return 'zip分卷(z01)' }
+        'zip-z01'  { return 'zip分卷(z01入口)' }
+        'zip-001'  { return 'zip分卷(001)' }
+        '7z-001'   { return '7z分卷' }
+        'rar-part' { return 'rar分卷(part1)' }
+        'rar-r00'  { return 'rar分卷(r00)' }
+        default    { return $Entry.Type }
+    }
+}
+
+# ==================== 压缩包入口检测 ====================
+function Get-ArchiveEntrypoints {
+    param(
+        [Parameter(Mandatory)][string]$RootDir,
+        [string[]]$ExcludeDirs = @()
+    )
+
+    $excludeNorm = @($ExcludeDirs | ForEach-Object { Get-NormalizedPath $_ })
+    $allFiles = @(Get-ChildItem -LiteralPath $RootDir -Recurse -File -Force -ErrorAction SilentlyContinue)
+    if ($allFiles.Count -eq 0) { return @() }
+
+    $entries = @()
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+
+    foreach ($file in $allFiles) {
+        $skip = $false
+        foreach ($ex in $excludeNorm) {
+            if ($ex -and (Test-IsUnderPath -ChildPath $file.FullName -ParentPath $ex)) { $skip = $true; break }
+        }
+        if ($skip) { continue }
+
+        $name = $file.Name
+        $full = $file.FullName
+
+        if ($file.Extension -ieq '.rar') {
+            if ($name -match '^(?<stem>.+?)\.part(?<part>\d+)\.rar$') {
+                $partNum = 0
+                [void][int]::TryParse($Matches.part, [ref]$partNum)
+                if ($partNum -ne 1) { continue }
+                if ($seen.Add($full)) { $entries += [pscustomobject]@{ Path = $full; Type = 'rar-part'; Dir = $file.DirectoryName; Base = $Matches.stem } }
+                continue
+            }
+            $r00 = Join-Path $file.DirectoryName ($file.BaseName + '.r00')
+            $type = if (Test-Path -LiteralPath $r00) { 'rar-r00' } else { 'rar' }
+            if ($seen.Add($full)) { $entries += [pscustomobject]@{ Path = $full; Type = $type; Dir = $file.DirectoryName; Base = $file.BaseName } }
+            continue
+        }
+
+        if ($file.Extension -ieq '.zip' -or $file.Extension -ieq '.7z') {
+            $isZipSplitZ = $false
+            if ($file.Extension -ieq '.zip') {
+                $z01 = Join-Path $file.DirectoryName ($file.BaseName + '.z01')
+                $isZipSplitZ = Test-Path -LiteralPath $z01
+            }
+            $type = if ($isZipSplitZ) { 'zip-z' } else { $file.Extension.TrimStart('.') }
+            if ($seen.Add($full)) { $entries += [pscustomobject]@{ Path = $full; Type = $type; Dir = $file.DirectoryName; Base = $file.BaseName } }
+            continue
+        }
+
+        if ($name -match '^(?<stem>.+?)\.(?<fmt>7z|zip)\.(?<part>\d+)$') {
+            $partNum = 0
+            [void][int]::TryParse($Matches.part, [ref]$partNum)
+            if ($partNum -ne 1) { continue }
+            $fmt = $Matches.fmt.ToLowerInvariant()
+            $type = "$fmt-001"
+            if ($seen.Add($full)) { $entries += [pscustomobject]@{ Path = $full; Type = $type; Dir = $file.DirectoryName; Base = $Matches.stem } }
+            continue
+        }
+
+        if ($name -match '^(?<stem>.+?)\.z(?<part>\d+)$') {
+            $partNum = 0
+            [void][int]::TryParse($Matches.part, [ref]$partNum)
+            if ($partNum -ne 1) { continue }
+            $zipCandidate = Join-Path $file.DirectoryName ($Matches.stem + '.zip')
+            if (Test-Path -LiteralPath $zipCandidate) {
+                if ($seen.Add($zipCandidate)) { $entries += [pscustomobject]@{ Path = $zipCandidate; Type = 'zip-z'; Dir = $file.DirectoryName; Base = $Matches.stem } }
+            } else {
+                if ($seen.Add($full)) { $entries += [pscustomobject]@{ Path = $full; Type = 'zip-z01'; Dir = $file.DirectoryName; Base = $Matches.stem } }
+            }
+            continue
+        }
+    }
+
+    return @($entries)
+}
+
+function Remove-ArchiveGroup {
+    param([Parameter(Mandatory)][pscustomobject]$Entry)
+    try {
+        switch -Regex ($Entry.Type) {
+            '^zip-z$' {
+                $dir = $Entry.Dir; $base = [regex]::Escape($Entry.Base)
+                Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match "^$base\.z\d+$" } | ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
+                Remove-Item -LiteralPath $Entry.Path -Force -ErrorAction SilentlyContinue
+            }
+            '^zip-z01$' {
+                $dir = $Entry.Dir; $base = [regex]::Escape($Entry.Base)
+                Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match "^$base\.z\d+$" } | ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
+                $zipPath = Join-Path $dir ($Entry.Base + '.zip')
+                if (Test-Path -LiteralPath $zipPath) { Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue }
+                if (Test-Path -LiteralPath $Entry.Path) { Remove-Item -LiteralPath $Entry.Path -Force -ErrorAction SilentlyContinue }
+            }
+            '^(zip|7z)-001$' {
+                $dir = $Entry.Dir; $stemEsc = [regex]::Escape($Entry.Base); $fmt = ($Entry.Type -split '-')[0]
+                Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match "^$stemEsc\.$fmt\.\d+$" } | ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
+            }
+            '^rar-part$' {
+                $dir = $Entry.Dir; $stemEsc = [regex]::Escape($Entry.Base)
+                Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match "^$stemEsc\.part\d+\.rar$" } | ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
+            }
+            '^rar-r00$' {
+                $dir = $Entry.Dir; $stemEsc = [regex]::Escape($Entry.Base)
+                Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match "^$stemEsc\.r\d\d$" } | ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
+                $rarPath = Join-Path $dir ($Entry.Base + '.rar')
+                if (Test-Path -LiteralPath $rarPath) { Remove-Item -LiteralPath $rarPath -Force -ErrorAction SilentlyContinue }
+            }
+            default {
+                Remove-Item -LiteralPath $Entry.Path -Force -ErrorAction SilentlyContinue
+            }
+        }
+        return $true
+    } catch {
+        Write-Host "  [WARN] 删除源压缩包失败: $_" -ForegroundColor Yellow
+        return $false
+    }
+}
+
+# ==================== 解压（全部使用 WinRAR）====================
+function Invoke-WinRARExtract {
+    param(
+        [Parameter(Mandatory)][string]$ArchivePath,
+        [Parameter(Mandatory)][string]$TargetDir,
+        [Parameter(Mandatory)][string]$ArchiveKey
+    )
+
+    New-DirectoryIfMissing -Path $TargetDir
+    $proc = Start-Process -FilePath $WinRarExe -ArgumentList @(
+        'x',
+        "-p$ArchiveKey",
+        '-ibck',
+        '-y',
+        '-or',
+        "`"$ArchivePath`"",
+        "`"$TargetDir\`""
+    ) -Wait -PassThru -NoNewWindow
+
+    if ($null -eq $proc -or $proc.ExitCode -ne 0) { return $false }
+
+    # 头加密 7z 遇错误密码时退出码仍为 0 却什么都不解；追加校验避免误判成功而误删。
+    $extracted = @(Get-ChildItem -LiteralPath $TargetDir -Force -ErrorAction SilentlyContinue)
+    if ($extracted.Count -eq 0) {
+        Write-Host "  [FAIL] 退出码 0 但未解出任何文件（疑似密码错误或头加密包无法读取）" -ForegroundColor Red
+        return $false
+    }
+    return $true
+}
+
+# 直接解压：先解到隔离临时目录（带校验），成功后并入 output\<相对路径>\，保持相对结构，冲突改名不覆盖
+function Expand-ArchiveDirect {
+    param(
+        [Parameter(Mandatory)][pscustomobject]$Entry,
+        [Parameter(Mandatory)][string]$TargetDir,
+        [Parameter(Mandatory)][string]$ArchiveKey
+    )
+
+    New-DirectoryIfMissing -Path $TargetDir
+    $tmp = Get-UniqueDirectoryPath -DirectoryPath (Join-Path $TargetDir (".__unpack_" + (Get-SafeFolderName -Name $Entry.Base)))
+    New-DirectoryIfMissing -Path $tmp
+
+    Write-Host "[EXTRACT] ($(Get-EntryLabel -Entry $Entry)) $(Split-Path -Leaf $Entry.Path) -> $TargetDir" -ForegroundColor Yellow
+    $success = Invoke-WinRARExtract -ArchivePath $Entry.Path -TargetDir $tmp -ArchiveKey $ArchiveKey
+
+    if (-not $success) {
+        if (Test-Path -LiteralPath $tmp) {
+            $leftover = @(Get-ChildItem -LiteralPath $tmp -Force -ErrorAction SilentlyContinue)
+            if ($leftover.Count -eq 0) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+            else { Write-Host "  [KEEP] 解压失败，保留临时目录: $(Split-Path -Leaf $tmp)" -ForegroundColor Yellow }
+        }
+        return $false
+    }
+
+    foreach ($item in @(Get-ChildItem -LiteralPath $tmp -Force -ErrorAction SilentlyContinue)) {
+        $dest = Join-Path $TargetDir $item.Name
+        if (Test-Path -LiteralPath $dest) { [void](Move-ExistingPathAside -Path $dest) }
+        Move-Item -LiteralPath $item.FullName -Destination $dest -ErrorAction Stop
+    }
+    Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+    return $true
+}
+
+function Remove-EmptyDirs {
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [string[]]$ProtectDirs = @()
+    )
+
+    $allDirs = @(Get-ChildItem -LiteralPath $Root -Directory -Recurse -Force -ErrorAction SilentlyContinue |
+        Where-Object { $dir = $_.FullName; -not ($ProtectDirs | Where-Object { Test-IsUnderPath -ChildPath $dir -ParentPath $_ }) } |
+        Sort-Object { $_.FullName.Split('\').Count } -Descending)
+
+    $count = 0
+    foreach ($dir in $allDirs) {
+        $items = @(Get-ChildItem -LiteralPath $dir.FullName -Force -ErrorAction SilentlyContinue)
+        if ($items.Count -eq 0) {
+            try { Remove-Item -LiteralPath $dir.FullName -Force -ErrorAction Stop; $count++ } catch { }
+        }
+    }
+    if ($count -gt 0) { Write-Host "  [OK] 清理了 $count 个空文件夹" -ForegroundColor Green }
+}
+
+# ==================== 主流程 ====================
 Write-Host "========================================" -ForegroundColor Cyan
-Write-Host "c291dGhwbHVz 压缩包处理脚本" -ForegroundColor Cyan
+Write-Host "c291dGhwbHVz 压缩包处理脚本（WinRAR）" -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host ""
 
-# 检查 7-Zip-Zstandard
-if (-not (Test-Path -LiteralPath $7zExe)) {
-    Write-Host "错误: 未找到 7-Zip-Zstandard" -ForegroundColor Red
-    Write-Host "路径: $7zExe" -ForegroundColor Red
-    Write-Host "请从 https://github.com/mcmilk/7-Zip-zstd 下载安装" -ForegroundColor Yellow
+if (-not (Test-Path -LiteralPath $WinRarExe)) {
+    Write-Host "错误: 未找到 WinRAR" -ForegroundColor Red
+    Write-Host "路径: $WinRarExe" -ForegroundColor Red
     Read-Host "按回车键退出"
     exit 1
 }
-Write-Host "✓ 7-Zip-Zstandard: $7zExe" -ForegroundColor Green
+Write-Host "[OK] WinRAR: $WinRarExe" -ForegroundColor Green
 Write-Host ""
 
-# 创建输出目录
-Ensure-Directory $Output
+New-DirectoryIfMissing -Path $Output
 
-# ==================== 处理压缩包 ====================
-Write-Host "查找并解压 .zip / .z01 / .7z / .7z.001 到 output" -ForegroundColor Yellow
+Write-Host "解压 .zip / .7z / .rar / 各类分卷 -> output（保持相对路径）" -ForegroundColor Yellow
 Write-Host "----------------------------------------"
+$entries = @(Get-ArchiveEntrypoints -RootDir $WorkDir -ExcludeDirs @($Output))
+if ($entries.Count -eq 0) {
+    Write-Host "未发现可解压的压缩包" -ForegroundColor Gray
+} else {
+    foreach ($entry in $entries) {
+        $relDir = Get-RelativeDirectory -RootDir $WorkDir -ChildDir $entry.Dir
+        $targetDir = if ($relDir) { Join-Path $Output $relDir } else { $Output }
 
-# 处理 .zip 和 .7z 文件（非分卷）
-# 说明：PowerShell 5.1 下 -Include/-Recurse 组合在某些路径（尤其包含 [] 等通配符字符）时容易筛不到文件。
-# 这里改为 -LiteralPath + -Filter（由文件系统提供方过滤），同时包含同目录与递归目录。
-$archives = @()
-$archives += Get-ChildItem -LiteralPath $WorkDir -Recurse -File -Filter "*.zip" -ErrorAction SilentlyContinue
-$archives += Get-ChildItem -LiteralPath $WorkDir -Recurse -File -Filter "*.7z"  -ErrorAction SilentlyContinue
-
-$archives = $archives |
-    Where-Object {
-        $_.FullName -notlike "*\output\*" -and
-        $_.Name -notmatch '\.7z\.\d+$'    # 防御性：如果误抓到类似 xxx.7z.001 这种命名
-    } |
-    Sort-Object -Property FullName -Unique
-
-foreach ($file in $archives) {
-    # 计算相对路径
-    $wdBase  = $WorkDir.TrimEnd('\') + '\'
-    $relPath = if ($file.DirectoryName.StartsWith($wdBase, [StringComparison]::OrdinalIgnoreCase)) {
-                   $file.DirectoryName.Substring($wdBase.Length).TrimEnd('\') } else { '' }
-
-    # 确定目标目录
-    if ($relPath) {
-        $targetDir = Join-Path $Output $relPath
-    } else {
-        $targetDir = $Output
-    }
-    
-    Ensure-Directory $targetDir
-    
-    # 检查是否有对应的 .z01 文件（zip分卷）
-    $baseName = $file.BaseName
-    $z01File = Join-Path $file.DirectoryName "$baseName.z01"
-    
-    if (Test-Path -LiteralPath $z01File) {
-        # zip 分卷压缩包
-        Write-Host "解压（zip分卷）: $($file.Name) → $targetDir" -ForegroundColor White
-        Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -ForegroundColor DarkGray
-        
-        Push-Location -LiteralPath $targetDir
-        & $7zExe x "-p$Password" -y -bsp1 "$($file.FullName)"
-        $exitCode = $LASTEXITCODE
-        Pop-Location
-        
-        Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -ForegroundColor DarkGray
-        
-        if ($exitCode -eq 0) {
-            Write-Host "  ✓ 成功: $($file.Name)" -ForegroundColor Green
+        $success = Expand-ArchiveDirect -Entry $entry -TargetDir $targetDir -ArchiveKey $Password
+        if ($success) {
+            Write-Host "  [OK] 成功: $(Split-Path -Leaf $entry.Path)" -ForegroundColor Green
             if ($DeleteFlag) {
-                Write-Host "  → 删除zip分卷文件: $baseName.z* 和 $baseName.zip" -ForegroundColor DarkGray
-                $escapedBase = [regex]::Escape($baseName)
-                Get-ChildItem -LiteralPath $file.DirectoryName -File -ErrorAction SilentlyContinue |
-                    Where-Object { $_.Name -match "^$escapedBase\.z\d+$" } |
-                    ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
-                Remove-Item -LiteralPath $file.FullName -Force -ErrorAction SilentlyContinue
+                if (Remove-ArchiveGroup -Entry $entry) { Write-Host "  [DELETE] 已删除源压缩包/分卷" -ForegroundColor DarkGray }
             }
         } else {
-            Write-Host "  ✗ 失败: $($file.Name) (ExitCode: $exitCode)" -ForegroundColor Red
+            Write-Host "  [FAIL] 失败（源文件已保留）: $(Split-Path -Leaf $entry.Path)" -ForegroundColor Red
         }
-    } else {
-        # 普通压缩包
-        Write-Host "解压: $($file.Name) → $targetDir" -ForegroundColor White
-        Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -ForegroundColor DarkGray
-        
-        Push-Location -LiteralPath $targetDir
-        & $7zExe x "-p$Password" -y -bsp1 "$($file.FullName)"
-        $exitCode = $LASTEXITCODE
-        Pop-Location
-        
-        Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -ForegroundColor DarkGray
-        
-        if ($exitCode -eq 0) {
-            Write-Host "  ✓ 成功: $($file.Name)" -ForegroundColor Green
-            if ($DeleteFlag) {
-                Remove-Item -LiteralPath $file.FullName -Force -ErrorAction SilentlyContinue
-                Write-Host "  → 已删除: $($file.FullName)" -ForegroundColor DarkGray
-            }
-        } else {
-            Write-Host "  ✗ 失败: $($file.Name) (ExitCode: $exitCode)" -ForegroundColor Red
-        }
+        Write-Host ""
     }
-    Write-Host ""
 }
 
-# 处理 .7z.001 分卷压缩包
-Write-Host ""
-$volumeArchives = Get-ChildItem -LiteralPath $WorkDir -Recurse -File -Filter "*.7z.*" -ErrorAction SilentlyContinue |
-    Where-Object {
-        $_.FullName -notlike "*\output\*" -and
-        $_.Name -match '\.7z\.(0*1)$'     # 仅取首卷：xxx.7z.001 / xxx.7z.0001
-    }
-
-foreach ($file in $volumeArchives) {
-    # 计算相对路径
-    $wdBase  = $WorkDir.TrimEnd('\') + '\'
-    $relPath = if ($file.DirectoryName.StartsWith($wdBase, [StringComparison]::OrdinalIgnoreCase)) {
-                   $file.DirectoryName.Substring($wdBase.Length).TrimEnd('\') } else { '' }
-
-    # 确定目标目录
-    if ($relPath) {
-        $targetDir = Join-Path $Output $relPath
-    } else {
-        $targetDir = $Output
-    }
-    
-    Ensure-Directory $targetDir
-    
-    Write-Host "解压（7z分卷）: $($file.Name) → $targetDir" -ForegroundColor White
-    Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -ForegroundColor DarkGray
-    
-    Push-Location -LiteralPath $targetDir
-    & $7zExe x "-p$Password" -y -bsp1 "$($file.FullName)"
-    $exitCode = $LASTEXITCODE
-    Pop-Location
-    
-    Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -ForegroundColor DarkGray
-    
-    if ($exitCode -eq 0) {
-        Write-Host "  ✓ 成功: $($file.Name)" -ForegroundColor Green
-        if ($DeleteFlag) {
-            $basePattern = $file.BaseName -replace '\.7z$', ''
-            $escapedBase = [regex]::Escape($basePattern)
-            Write-Host "  → 删除7z分卷文件: $basePattern.7z.*" -ForegroundColor DarkGray
-            $volumeFiles = Get-ChildItem -LiteralPath $file.DirectoryName -File -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -match "^$escapedBase\.7z\.\d+$" }
-            $volumeFiles | ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
-        }
-    } else {
-        Write-Host "  ✗ 失败: $($file.Name) (ExitCode: $exitCode)" -ForegroundColor Red
-    }
-    Write-Host ""
-}
-
-# ==================== 清理空文件夹 ====================
 if ($DeleteFlag) {
     Write-Host "清理空文件夹..." -ForegroundColor Yellow
     Write-Host "----------------------------------------"
-    
-    # 获取所有子目录，按深度倒序排列（先处理最深的）
-    $allDirs = Get-ChildItem -LiteralPath $WorkDir -Directory -Recurse -ErrorAction SilentlyContinue | 
-        Where-Object { 
-            $_.FullName -notlike "*\output\*" -and 
-            $_.FullName -ne $Output
-        } | 
-        Sort-Object { $_.FullName.Split('\').Count } -Descending
-    
-    $deletedCount = 0
-    foreach ($dir in $allDirs) {
-        # 检查目录是否为空
-        $items = Get-ChildItem -LiteralPath $dir.FullName -Force -ErrorAction SilentlyContinue
-        if ($items.Count -eq 0) {
-            try {
-                Remove-Item -LiteralPath $dir.FullName -Force -ErrorAction Stop
-                Write-Host "已删除: $($dir.FullName)" -ForegroundColor DarkGray
-                $deletedCount++
-            } catch {
-                # 忽略删除失败
-            }
-        }
-    }
-    
-    if ($deletedCount -eq 0) {
-        Write-Host "没有空文件夹需要清理" -ForegroundColor Gray
-    } else {
-        Write-Host "共清理 $deletedCount 个空文件夹" -ForegroundColor Green
-    }
+    Remove-EmptyDirs -Root $WorkDir -ProtectDirs @($Output)
 } else {
-    Write-Host "KeepFiles 模式，跳过空文件夹清理" -ForegroundColor Gray
+    Write-Host "KeepFiles 模式，跳过删除" -ForegroundColor Gray
 }
 
 Write-Host ""
 Write-Host "========================================" -ForegroundColor Cyan
-Write-Host "全部完成！" -ForegroundColor Cyan
+Write-Host "全部完成" -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host ""
 Read-Host "按回车键退出"
