@@ -6,6 +6,7 @@
     1. 在工作目录中查找初始 .mp4 / 压缩包入口并按文件名分类：
        - 文件名包含 doro：使用 DORO 密码 doro，执行三层管线
        - 文件基名为四位数字：使用 PADIO 密码 PADIO294，执行两层管线
+       - 无法自动分类：弹出方向键菜单，手动选择 DORO / PADIO / 跳过
     2. 中间层解压到压缩包对应的隔离目录，避免 output0/output1 平铺混在一起
     3. 最后一层使用 smart extract：压缩包根目录有文件夹则直接解到 output；否则解到同名目录
     4. 每次解压前做目标冲突检查，发现重复文件/目录会自动改名，避免覆盖
@@ -45,8 +46,100 @@ $Profiles = @{
         JunkFiles = @()
     }
 }
+$ManualProfileSelections = @{}
 
 # ==================== 基础工具函数 ====================
+function Show-Menu {
+    param(
+        [Parameter(Mandatory)][string]$Title,
+        [Parameter(Mandatory)][string[]]$Options
+    )
+
+    $selected = 0
+    $cursorVisible = [Console]::CursorVisible
+    [Console]::CursorVisible = $false
+
+    $topLeft = [char]0x2554
+    $topRight = [char]0x2557
+    $bottomLeft = [char]0x255A
+    $bottomRight = [char]0x255D
+    $horizontal = [char]0x2550
+    $vertical = [char]0x2551
+    $middleLeft = [char]0x2560
+    $middleRight = [char]0x2563
+
+    function Get-DisplayWidth {
+        param([string]$Text)
+
+        $width = 0
+        foreach ($char in $Text.ToCharArray()) {
+            $code = [int]$char
+            if (($code -ge 0x1100 -and $code -le 0x115F) -or
+                ($code -ge 0x2E80 -and $code -le 0xA4CF -and $code -ne 0x303F) -or
+                ($code -ge 0xAC00 -and $code -le 0xD7A3) -or
+                ($code -ge 0xF900 -and $code -le 0xFAFF) -or
+                ($code -ge 0xFE10 -and $code -le 0xFE6F) -or
+                ($code -ge 0xFF01 -and $code -le 0xFF60) -or
+                ($code -ge 0xFFE0 -and $code -le 0xFFE6)) {
+                $width += 2
+            } else {
+                $width += 1
+            }
+        }
+        return $width
+    }
+
+    function Pad-ToDisplayWidth {
+        param([string]$Text, [int]$TargetWidth)
+
+        $displayWidth = Get-DisplayWidth -Text $Text
+        $pad = $TargetWidth - $displayWidth
+        if ($pad -gt 0) { return $Text + (' ' * $pad) }
+        return $Text
+    }
+
+    $allLines = @(" $Title ") + ($Options | ForEach-Object { "  > $_" })
+    $maxWidth = ($allLines | ForEach-Object { Get-DisplayWidth -Text $_ } | Measure-Object -Maximum).Maximum
+    $width = [Math]::Max($maxWidth + 2, 30)
+
+    try {
+        while ($true) {
+            [Console]::Clear()
+            $border = "$horizontal" * $width
+            Write-Host "$topLeft$border$topRight" -ForegroundColor Cyan
+            $titleText = Pad-ToDisplayWidth -Text " $Title " -TargetWidth $width
+            Write-Host "$vertical$titleText$vertical" -ForegroundColor Cyan
+            Write-Host "$middleLeft$border$middleRight" -ForegroundColor Cyan
+
+            for ($i = 0; $i -lt $Options.Count; $i++) {
+                $marker = if ($i -eq $selected) { '>' } else { ' ' }
+                $text = Pad-ToDisplayWidth -Text "  $marker $($Options[$i])" -TargetWidth $width
+                Write-Host "$vertical" -NoNewline -ForegroundColor Cyan
+                if ($i -eq $selected) {
+                    Write-Host $text -NoNewline -ForegroundColor Green
+                } else {
+                    Write-Host $text -NoNewline -ForegroundColor White
+                }
+                Write-Host "$vertical" -ForegroundColor Cyan
+            }
+
+            Write-Host "$bottomLeft$border$bottomRight" -ForegroundColor Cyan
+            Write-Host ""
+            Write-Host "  Up/Down 选择，Enter 确认，Esc 跳过" -ForegroundColor DarkGray
+
+            $key = [Console]::ReadKey($true)
+            switch ($key.Key) {
+                'UpArrow'   { $selected = if ($selected -gt 0) { $selected - 1 } else { $Options.Count - 1 } }
+                'DownArrow' { $selected = if ($selected -lt $Options.Count - 1) { $selected + 1 } else { 0 } }
+                'Enter'     { return $selected }
+                'Escape'    { return -1 }
+            }
+        }
+    } finally {
+        [Console]::CursorVisible = $cursorVisible
+    }
+}
+
 function New-DirectoryIfMissing {
     param([Parameter(Mandatory)][string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) {
@@ -184,6 +277,77 @@ function Get-ProfileForName {
 
     if ($BaseName -match '(?i)doro') { return $Profiles.DORO }
     if ($BaseName -match '^\d{4}(__\d+)?$') { return $Profiles.PADIO }
+    return $null
+}
+
+function Set-ManualProfileSelection {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][pscustomobject]$ArchiveProfile
+    )
+
+    $script:ManualProfileSelections[(Get-NormalizedPath -Path $Path)] = $ArchiveProfile.Key
+}
+
+function Get-ManualProfileSelection {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $key = Get-NormalizedPath -Path $Path
+    if (-not $script:ManualProfileSelections.ContainsKey($key)) { return $null }
+
+    $profileKey = $script:ManualProfileSelections[$key]
+    if ($Profiles.ContainsKey($profileKey)) { return $Profiles[$profileKey] }
+    return $null
+}
+
+function Select-ProfileForUnknownArchive {
+    param(
+        [Parameter(Mandatory)][string]$DisplayName,
+        [string]$FullPath = ""
+    )
+
+    Write-Host "[ASK] 无法自动分类: $DisplayName" -ForegroundColor Yellow
+    if ($FullPath) {
+        Write-Host "      $FullPath" -ForegroundColor DarkGray
+    }
+
+    $choice = Show-Menu -Title "选择解压入口: $DisplayName" -Options @(
+        "DORO - 密码 doro，三层解压",
+        "PADIO - 密码 PADIO294，两层解压",
+        "跳过 - 不处理这个文件"
+    )
+
+    switch ($choice) {
+        0 { return $Profiles.DORO }
+        1 { return $Profiles.PADIO }
+        default { return $null }
+    }
+}
+
+function Resolve-ArchiveProfile {
+    param(
+        [Parameter(Mandatory)][string]$BaseName,
+        [Parameter(Mandatory)][string]$DisplayName,
+        [string]$FullPath = "",
+        [switch]$PromptIfUnknown
+    )
+
+    $archiveProfile = Get-ProfileForName -BaseName $BaseName
+    if ($null -ne $archiveProfile) { return $archiveProfile }
+
+    if ($FullPath) {
+        $archiveProfile = Get-ManualProfileSelection -Path $FullPath
+        if ($null -ne $archiveProfile) { return $archiveProfile }
+    }
+
+    if ($PromptIfUnknown) {
+        $archiveProfile = Select-ProfileForUnknownArchive -DisplayName $DisplayName -FullPath $FullPath
+        if ($null -ne $archiveProfile -and $FullPath) {
+            Set-ManualProfileSelection -Path $FullPath -ArchiveProfile $archiveProfile
+        }
+        return $archiveProfile
+    }
+
     return $null
 }
 
@@ -601,7 +765,7 @@ function Convert-ClassifiedMp4ToZip {
         })
 
     foreach ($file in $mp4Files) {
-        $archiveProfile = Get-ProfileForName -BaseName $file.BaseName
+        $archiveProfile = Resolve-ArchiveProfile -BaseName $file.BaseName -DisplayName $file.Name -FullPath $file.FullName -PromptIfUnknown
         if ($null -eq $archiveProfile) {
             Write-Host "[SKIP] 无法分类 MP4: $($file.Name)" -ForegroundColor DarkGray
             continue
@@ -612,6 +776,7 @@ function Convert-ClassifiedMp4ToZip {
 
         try {
             Rename-Item -LiteralPath $file.FullName -NewName (Split-Path -Leaf $zipPath) -ErrorAction Stop
+            Set-ManualProfileSelection -Path $zipPath -ArchiveProfile $archiveProfile
             Write-Host "[RENAME] $($file.Name) -> $(Split-Path -Leaf $zipPath) [$($archiveProfile.Display)]" -ForegroundColor Green
         } catch {
             Write-Host "[ERROR] MP4 重命名失败: $($file.Name) - $_" -ForegroundColor Red
@@ -823,7 +988,7 @@ if ($initialEntries.Count -eq 0) {
     Write-Host "未发现可处理的初始压缩包" -ForegroundColor Gray
 } else {
     foreach ($entry in $initialEntries) {
-        $archiveProfile = Get-ProfileForName -BaseName $entry.Base
+        $archiveProfile = Resolve-ArchiveProfile -BaseName $entry.Base -DisplayName (Split-Path -Leaf $entry.Path) -FullPath $entry.Path -PromptIfUnknown
         if ($null -eq $archiveProfile) {
             Write-Host "[SKIP] 无法分类: $(Split-Path -Leaf $entry.Path)" -ForegroundColor DarkGray
             continue
