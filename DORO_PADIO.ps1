@@ -888,6 +888,47 @@ function Invoke-FinalLayer {
     }
 }
 
+function Get-ResumableStage0Jobs {
+    param([object[]]$ExistingJobs = @())
+
+    if (-not (Test-Path -LiteralPath $Output0)) { return @() }
+
+    $knownStage0Dirs = @{}
+    foreach ($job in @($ExistingJobs | Where-Object { $_.Success })) {
+        if ($job.Stage0Dir) {
+            $knownStage0Dirs[(Get-NormalizedPath -Path $job.Stage0Dir)] = $true
+        }
+    }
+
+    $resumedJobs = @()
+    $stage0Dirs = @(Get-ChildItem -LiteralPath $Output0 -Directory -Force -ErrorAction SilentlyContinue)
+    foreach ($dir in $stage0Dirs) {
+        $dirKey = Get-NormalizedPath -Path $dir.FullName
+        if ($knownStage0Dirs.ContainsKey($dirKey)) { continue }
+
+        $hasArchives = @(Get-ArchiveEntrypoints -RootDir $dir.FullName).Count -gt 0
+        if (-not $hasArchives) { continue }
+
+        $archiveProfile = Resolve-ArchiveProfile -BaseName $dir.Name -DisplayName $dir.Name -FullPath $dir.FullName -PromptIfUnknown
+        if ($null -eq $archiveProfile) {
+            Write-Host "[SKIP] 无法分类已存在的 output0 目录: $($dir.Name)" -ForegroundColor DarkGray
+            continue
+        }
+
+        Write-Host "[RESUME] output0\$($dir.Name) -> $($archiveProfile.Display), $($archiveProfile.Depth) 层" -ForegroundColor Cyan
+        $resumedJobs += [pscustomobject]@{
+            Success   = $true
+            Profile   = $archiveProfile
+            Source    = $null
+            Stage0Dir = $dir.FullName
+            Name      = $dir.Name
+            Resumed   = $true
+        }
+    }
+
+    return @($resumedJobs)
+}
+
 function Remove-JunkFiles {
     param([object[]]$Jobs)
 
@@ -1014,6 +1055,11 @@ if ($initialEntries.Count -eq 0) {
 }
 
 $successfulJobs = @($jobs | Where-Object { $_.Success })
+$resumedJobs = @(Get-ResumableStage0Jobs -ExistingJobs $successfulJobs)
+if ($resumedJobs.Count -gt 0) {
+    Write-Host "`n恢复已有 output0 中间任务: $($resumedJobs.Count) 个" -ForegroundColor Yellow
+    $successfulJobs = @($successfulJobs + $resumedJobs)
+}
 
 Write-Host "`n步骤 2: PADIO 最终层 / DORO 中间层" -ForegroundColor Yellow
 Write-Host "----------------------------------------"
