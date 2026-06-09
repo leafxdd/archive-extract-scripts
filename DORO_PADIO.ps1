@@ -1,15 +1,22 @@
 ﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
-    DORO/PADIO 自动分类融合解压脚本
+    DORO/PADIO 自动分类融合解压脚本（全 WinRAR 版）
 .DESCRIPTION
     1. 在工作目录中查找初始 .mp4 / 压缩包入口并按文件名分类：
        - 文件名包含 doro：使用 DORO 密码 doro，执行三层管线
        - 文件基名为四位数字：使用 PADIO 密码 PADIO294，执行两层管线
        - 无法自动分类：弹出方向键菜单，手动选择 DORO / PADIO / 跳过
     2. 中间层解压到压缩包对应的隔离目录，避免 output0/output1 平铺混在一起
-    3. 最后一层使用 smart extract：压缩包根目录有文件夹则直接解到 output；否则解到同名目录
-    4. 每次解压前做目标冲突检查，发现重复文件/目录会自动改名，避免覆盖
+    3. 最后一层 smart extract：先解到隔离临时目录再判断结构（不依赖 7z 列表）
+       - 顶层含文件夹：把顶层各项直接铺到 output
+       - 顶层全是文件：解压到压缩包同名目录，避免散落
+    4. 每次解压前/铺放前做目标冲突检查，发现重复文件/目录会自动改名，避免覆盖
+    5. 只有整条解压链全部成功后才删除该链的源文件和中间压缩包
+.NOTES
+    全部解压均使用 WinRAR（GUI 程序，Start-Process -Wait 取退出码）：
+    密码错误时 WinRAR 返回非 0（7z 档 3、zip 档 10），可靠区分成功/失败。
+    不再依赖 7-Zip。本脚本处理的压缩包不含 7z-zstd 专有压缩算法。
 #>
 
 param(
@@ -22,7 +29,6 @@ param(
 $OutputEncoding = [System.Text.Encoding]::UTF8
 $PSDefaultParameterValues['*:Encoding'] = 'utf8'
 
-$SevenZipExe = Join-Path $env:ProgramFiles "7-Zip-Zstandard\7z.exe"
 $WinRarExe = Join-Path $env:ProgramFiles "WinRAR\WinRAR.exe"
 $DeleteFlag = -not $KeepFiles
 
@@ -515,160 +521,7 @@ function Remove-ArchiveGroup {
     }
 }
 
-# ==================== 压缩包预读和冲突处理 ====================
-function Get-ArchiveListing {
-    param(
-        [Parameter(Mandatory)][string]$ArchivePath,
-        [Parameter(Mandatory)][string]$ArchiveKey
-    )
-
-    try {
-        $raw = & $SevenZipExe l "-p$ArchiveKey" -slt -- $ArchivePath 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            Write-Host "  [WARN] 无法预读压缩包结构: $(Split-Path -Leaf $ArchivePath)" -ForegroundColor Yellow
-            return $null
-        }
-
-        $entries = @()
-        $current = @{}
-        foreach ($line in $raw) {
-            if ($line -match '^Path = (.*)$') {
-                if ($current.ContainsKey('Path')) {
-                    $entries += [pscustomobject]$current
-                }
-                $current = @{ Path = $matches[1] }
-            } elseif ($line -match '^Folder = (.*)$') {
-                $current['Folder'] = $matches[1]
-            } elseif ($line -match '^Attributes = (.*)$') {
-                $current['Attributes'] = $matches[1]
-            }
-        }
-        if ($current.ContainsKey('Path')) {
-            $entries += [pscustomobject]$current
-        }
-
-        $archiveLeaf = Split-Path $ArchivePath -Leaf
-        $archiveFull = Get-NormalizedPath -Path $ArchivePath
-        $filteredEntries = @()
-        foreach ($entry in $entries) {
-            $entryPath = [string]$entry.Path
-            if (-not $entryPath) { continue }
-            if ($entryPath -eq $archiveLeaf) { continue }
-            if ([System.IO.Path]::IsPathRooted($entryPath)) {
-                if ((Split-Path -Leaf $entryPath) -eq $archiveLeaf) { continue }
-                if ((Get-NormalizedPath -Path $entryPath) -ieq $archiveFull) { continue }
-            }
-            $filteredEntries += $entry
-        }
-        return @($filteredEntries)
-    } catch {
-        Write-Host "  [WARN] 预读压缩包结构时出错: $_" -ForegroundColor Yellow
-        return $null
-    }
-}
-
-function Test-ArchiveRelativePathSafe {
-    param([Parameter(Mandatory)][string]$RelativePath)
-
-    if ([string]::IsNullOrWhiteSpace($RelativePath)) { return $false }
-    if ([System.IO.Path]::IsPathRooted($RelativePath)) { return $false }
-
-    $parts = $RelativePath -split '[/\\]+'
-    foreach ($part in $parts) {
-        if ($part -eq '..') { return $false }
-    }
-    return $true
-}
-
-function Assert-ArchiveListingSafe {
-    param([Parameter(Mandatory)][object[]]$Listing)
-
-    foreach ($entry in $Listing) {
-        $rel = ([string]$entry.Path).TrimStart('\', '/')
-        if (-not (Test-ArchiveRelativePathSafe -RelativePath $rel)) {
-            throw "压缩包包含不安全路径: $($entry.Path)"
-        }
-    }
-}
-
-function Test-ArchiveHasRootFolderFromListing {
-    param([object[]]$Listing)
-
-    if ($null -eq $Listing) { return $false }
-
-    foreach ($entry in $Listing) {
-        $rel = ([string]$entry.Path).TrimStart('\', '/').TrimEnd('\', '/')
-        if ([string]::IsNullOrWhiteSpace($rel)) { continue }
-        if (-not (Test-ArchiveRelativePathSafe -RelativePath $rel)) { continue }
-
-        $parts = @($rel -split '[/\\]+')
-        $isFolder = ($parts.Count -gt 1) -or
-            ($entry.PSObject.Properties.Name -contains 'Folder' -and $entry.Folder -eq '+') -or
-            ($entry.PSObject.Properties.Name -contains 'Attributes' -and $entry.Attributes -match '^D') -or
-            ([string]$entry.Path).EndsWith('\') -or
-            ([string]$entry.Path).EndsWith('/')
-
-        if ($isFolder) { return $true }
-    }
-
-    return $false
-}
-
-function Get-ArchiveTopLevelNames {
-    param([Parameter(Mandatory)][object[]]$Listing)
-
-    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
-    $names = @()
-
-    foreach ($entry in $Listing) {
-        $rel = ([string]$entry.Path).TrimStart('\', '/').TrimEnd('\', '/')
-        if ([string]::IsNullOrWhiteSpace($rel)) { continue }
-        if (-not (Test-ArchiveRelativePathSafe -RelativePath $rel)) {
-            throw "压缩包包含不安全路径: $($entry.Path)"
-        }
-
-        $top = @($rel -split '[/\\]+')[0]
-        if ([string]::IsNullOrWhiteSpace($top)) { continue }
-        if ($top -eq '.' -or $top -eq '..') {
-            throw "压缩包包含不安全路径: $($entry.Path)"
-        }
-
-        if ($seen.Add($top)) {
-            $names += $top
-        }
-    }
-
-    return @($names)
-}
-
-function Resolve-FlatTargetConflicts {
-    param(
-        [Parameter(Mandatory)][object[]]$Listing,
-        [Parameter(Mandatory)][string]$TargetDir
-    )
-
-    New-DirectoryIfMissing -Path $TargetDir
-    $topNames = Get-ArchiveTopLevelNames -Listing $Listing
-    foreach ($name in $topNames) {
-        $targetPath = Join-Path $TargetDir $name
-        if (Test-Path -LiteralPath $targetPath) {
-            [void](Move-ExistingPathAside -Path $targetPath)
-        }
-    }
-}
-
-# ==================== 解压包装 ====================
-function Invoke-7zExtract {
-    param(
-        [Parameter(Mandatory)][string]$ArchivePath,
-        [Parameter(Mandatory)][string]$TargetDir,
-        [Parameter(Mandatory)][string]$ArchiveKey
-    )
-
-    & $SevenZipExe x "-p$ArchiveKey" -aot -y "-o$TargetDir" -- $ArchivePath | Out-Host
-    return ($LASTEXITCODE -eq 0)
-}
-
+# ==================== 解压包装（全部使用 WinRAR）====================
 function Invoke-WinRARExtract {
     param(
         [Parameter(Mandatory)][string]$ArchivePath,
@@ -676,6 +529,8 @@ function Invoke-WinRARExtract {
         [Parameter(Mandatory)][string]$ArchiveKey
     )
 
+    New-DirectoryIfMissing -Path $TargetDir
+    # WinRAR.exe 是 GUI 程序，必须 Start-Process -Wait 才能拿到真实退出码；-or = 同名自动改名兜底。
     $proc = Start-Process -FilePath $WinRarExe -ArgumentList @(
         'x',
         "-p$ArchiveKey",
@@ -686,65 +541,50 @@ function Invoke-WinRARExtract {
         "`"$TargetDir\`""
     ) -Wait -PassThru -NoNewWindow
 
-    return ($proc.ExitCode -eq 0)
+    if ($null -eq $proc -or $proc.ExitCode -ne 0) {
+        # 数据加密档退出码可靠：7z 档=3，zip 档=10，rar 档=非 0
+        return $false
+    }
+
+    # 头加密 7z（-mhe=on）遇错误密码时 WinRAR 仍返回退出码 0 却什么都不解，
+    # 单看退出码会误判成功并误删源文件。故追加校验：必须真的解出了内容。
+    # 调用方传入的 $TargetDir 是新建的隔离空目录，目录内任何条目都来自本次解压。
+    $extracted = @(Get-ChildItem -LiteralPath $TargetDir -Force -ErrorAction SilentlyContinue)
+    if ($extracted.Count -eq 0) {
+        Write-Host "  [FAIL] 退出码 0 但未解出任何文件（疑似密码错误或头加密包无法读取）" -ForegroundColor Red
+        return $false
+    }
+
+    return $true
 }
 
-function Invoke-PreparedExtraction {
+# 隔离解压：解到一个唯一目标目录（stage0 / 中间层 / smart 临时层用，绝不平铺、绝不覆盖）
+function Invoke-IsolatedExtraction {
     param(
         [Parameter(Mandatory)][pscustomobject]$Entry,
         [Parameter(Mandatory)][string]$TargetDir,
-        [Parameter(Mandatory)][string]$ArchiveKey,
-        [Parameter(Mandatory)][ValidateSet('7z', 'WinRAR')][string]$Tool,
-        [Parameter(Mandatory)][ValidateSet('Isolated', 'Flat')][string]$TargetMode,
-        [object[]]$Listing = $null
+        [Parameter(Mandatory)][string]$ArchiveKey
     )
 
-    $needsListing = ($TargetMode -eq 'Flat')
-    if ($null -eq $Listing -and $needsListing) {
-        $Listing = Get-ArchiveListing -ArchivePath $Entry.Path -ArchiveKey $ArchiveKey
+    $actualTarget = Get-UniqueDirectoryPath -DirectoryPath $TargetDir
+    if ($actualTarget -ne $TargetDir) {
+        Write-Host "  [RENAME] 目标目录已存在，改用: $(Split-Path -Leaf $actualTarget)" -ForegroundColor Yellow
     }
+    New-DirectoryIfMissing -Path $actualTarget
 
-    try {
-        if ($null -ne $Listing) {
-            Assert-ArchiveListingSafe -Listing $Listing
-        }
+    Write-Host "[EXTRACT] ($(Get-EntryLabel -Entry $Entry)) $(Split-Path -Leaf $Entry.Path) -> $actualTarget" -ForegroundColor Yellow
+    $success = Invoke-WinRARExtract -ArchivePath $Entry.Path -TargetDir $actualTarget -ArchiveKey $ArchiveKey
 
-        $actualTarget = $TargetDir
-        if ($TargetMode -eq 'Isolated') {
-            $actualTarget = Get-UniqueDirectoryPath -DirectoryPath $TargetDir
-            if ($actualTarget -ne $TargetDir) {
-                Write-Host "  [RENAME] 隔离目录已存在，改用: $(Split-Path -Leaf $actualTarget)" -ForegroundColor Yellow
-            }
-            New-DirectoryIfMissing -Path $actualTarget
-        } else {
-            New-DirectoryIfMissing -Path $actualTarget
-            if ($null -ne $Listing) {
-                Resolve-FlatTargetConflicts -Listing $Listing -TargetDir $actualTarget
-            } else {
-                Write-Host "  [WARN] 未能预读冲突，将依赖解压工具自动改名保护" -ForegroundColor Yellow
-            }
-        }
-
-        Write-Host "[EXTRACT] ($(Get-EntryLabel -Entry $Entry)) $(Split-Path -Leaf $Entry.Path) -> $actualTarget" -ForegroundColor Yellow
-        $success = if ($Tool -eq 'WinRAR') {
-            Invoke-WinRARExtract -ArchivePath $Entry.Path -TargetDir $actualTarget -ArchiveKey $ArchiveKey
-        } else {
-            Invoke-7zExtract -ArchivePath $Entry.Path -TargetDir $actualTarget -ArchiveKey $ArchiveKey
-        }
-
-        return [pscustomobject]@{
-            Success   = $success
-            TargetDir = $actualTarget
-        }
-    } catch {
-        Write-Host "  [ERROR] 解压前检查失败: $_" -ForegroundColor Red
-        return [pscustomobject]@{
-            Success   = $false
-            TargetDir = $TargetDir
-        }
+    return [pscustomobject]@{
+        Success   = $success
+        TargetDir = $actualTarget
     }
 }
 
+# 最后一层 smart extract：先解到隔离临时目录，再按内容铺放（不依赖任何列表命令）
+#   - 顶层含文件夹：把顶层各项直接移入 output（"直接解压"语义）
+#   - 顶层全是文件：把临时目录整体改名为压缩包同名目录，避免散落
+# 所有目标冲突一律自动改名，绝不覆盖。
 function Expand-ArchiveSmartFinal {
     param(
         [Parameter(Mandatory)][pscustomobject]$Entry,
@@ -752,18 +592,42 @@ function Expand-ArchiveSmartFinal {
         [Parameter(Mandatory)][string]$ArchiveKey
     )
 
-    $listing = Get-ArchiveListing -ArchivePath $Entry.Path -ArchiveKey $ArchiveKey
-    $hasRootFolder = Test-ArchiveHasRootFolderFromListing -Listing $listing
+    New-DirectoryIfMissing -Path $OutputDir
+    $baseName = Get-SafeFolderName -Name $Entry.Base
+    $tmpTarget = Join-Path $OutputDir (".__unpack_" + $baseName)
+    $result = Invoke-IsolatedExtraction -Entry $Entry -TargetDir $tmpTarget -ArchiveKey $ArchiveKey
+    $tmp = $result.TargetDir
 
-    if ($hasRootFolder) {
-        Write-Host "  [SMART] 根目录含文件夹，直接解压到 output" -ForegroundColor DarkGray
-        return Invoke-PreparedExtraction -Entry $Entry -TargetDir $OutputDir -ArchiveKey $ArchiveKey -Tool '7z' -TargetMode 'Flat' -Listing $listing
+    if (-not $result.Success) {
+        if (Test-Path -LiteralPath $tmp) {
+            $leftover = @(Get-ChildItem -LiteralPath $tmp -Force -ErrorAction SilentlyContinue)
+            if ($leftover.Count -eq 0) {
+                Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+            } else {
+                Write-Host "  [KEEP] 解压失败，保留临时目录: $(Split-Path -Leaf $tmp)" -ForegroundColor Yellow
+            }
+        }
+        return [pscustomobject]@{ Success = $false; TargetDir = $OutputDir }
     }
 
-    $folderName = Get-SafeFolderName -Name $Entry.Base
-    $target = Join-Path $OutputDir $folderName
-    Write-Host "  [SMART] 根目录无文件夹，解压到同名目录: $folderName" -ForegroundColor DarkGray
-    return Invoke-PreparedExtraction -Entry $Entry -TargetDir $target -ArchiveKey $ArchiveKey -Tool '7z' -TargetMode 'Isolated' -Listing $listing
+    $items = @(Get-ChildItem -LiteralPath $tmp -Force -ErrorAction SilentlyContinue)
+    $hasFolder = @($items | Where-Object { $_.PSIsContainer }).Count -gt 0
+
+    if ($hasFolder) {
+        Write-Host "  [SMART] 根目录含文件夹，直接铺到 output" -ForegroundColor DarkGray
+        foreach ($item in $items) {
+            $dest = Join-Path $OutputDir $item.Name
+            if (Test-Path -LiteralPath $dest) { [void](Move-ExistingPathAside -Path $dest) }
+            Move-Item -LiteralPath $item.FullName -Destination $dest -ErrorAction Stop
+        }
+        Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+    } else {
+        $dest = Get-UniqueDirectoryPath -DirectoryPath (Join-Path $OutputDir $baseName)
+        Write-Host "  [SMART] 根目录无文件夹，解压到同名目录: $(Split-Path -Leaf $dest)" -ForegroundColor DarkGray
+        Move-Item -LiteralPath $tmp -Destination $dest -ErrorAction Stop
+    }
+
+    return [pscustomobject]@{ Success = $true; TargetDir = $OutputDir }
 }
 
 # ==================== 管线处理 ====================
@@ -805,7 +669,7 @@ function Invoke-InitialStage {
 
     $targetName = Get-SafeFolderName -Name $Entry.Base
     $targetDir = Join-Path $Output0 $targetName
-    $result = Invoke-PreparedExtraction -Entry $Entry -TargetDir $targetDir -ArchiveKey $ArchiveProfile.Password -Tool 'WinRAR' -TargetMode 'Isolated'
+    $result = Invoke-IsolatedExtraction -Entry $Entry -TargetDir $targetDir -ArchiveKey $ArchiveProfile.Password
 
     if ($result.Success) {
         Write-Host "  [OK] 第一层完成 [$($ArchiveProfile.Display)]" -ForegroundColor Green
@@ -854,7 +718,7 @@ function Invoke-IntermediateLayer {
             Join-Path $TargetRoot $archiveFolder
         }
 
-        $result = Invoke-PreparedExtraction -Entry $entry -TargetDir $targetDir -ArchiveKey $ArchiveProfile.Password -Tool '7z' -TargetMode 'Isolated'
+        $result = Invoke-IsolatedExtraction -Entry $entry -TargetDir $targetDir -ArchiveKey $ArchiveProfile.Password
         $processedEntries += $entry
         if ($result.Success) {
             Write-Host "  [OK] $LayerName 完成" -ForegroundColor Green
@@ -1070,17 +934,9 @@ function Remove-IntermediateDirsIfEmpty {
 
 # ==================== 主流程 ====================
 Write-Host "========================================" -ForegroundColor Cyan
-Write-Host "DORO/PADIO 自动分类融合解压脚本" -ForegroundColor Cyan
+Write-Host "DORO/PADIO 自动分类融合解压脚本（WinRAR）" -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host ""
-
-if (-not (Test-Path -LiteralPath $SevenZipExe)) {
-    Write-Host "错误: 未找到 7-Zip-Zstandard" -ForegroundColor Red
-    Write-Host "路径: $SevenZipExe" -ForegroundColor Red
-    Read-Host "按回车键退出"
-    exit 1
-}
-Write-Host "[OK] 7-Zip-Zstandard: $SevenZipExe" -ForegroundColor Green
 
 if (-not (Test-Path -LiteralPath $WinRarExe)) {
     Write-Host "错误: 未找到 WinRAR" -ForegroundColor Red
