@@ -548,7 +548,18 @@ function Get-ArchiveListing {
         }
 
         $archiveLeaf = Split-Path $ArchivePath -Leaf
-        return @($entries | Where-Object { $_.Path -and $_.Path -ne $archiveLeaf })
+        $archiveFull = Get-NormalizedPath -Path $ArchivePath
+        $filteredEntries = @()
+        foreach ($entry in $entries) {
+            $entryPath = [string]$entry.Path
+            if (-not $entryPath) { continue }
+            if ($entryPath -eq $archiveLeaf) { continue }
+            if ([System.IO.Path]::IsPathRooted($entryPath)) {
+                if ((Get-NormalizedPath -Path $entryPath) -ieq $archiveFull) { continue }
+            }
+            $filteredEntries += $entry
+        }
+        return @($filteredEntries)
     } catch {
         Write-Host "  [WARN] 预读压缩包结构时出错: $_" -ForegroundColor Yellow
         return $null
@@ -687,7 +698,8 @@ function Invoke-PreparedExtraction {
         [object[]]$Listing = $null
     )
 
-    if ($null -eq $Listing) {
+    $needsListing = ($TargetMode -eq 'Flat')
+    if ($null -eq $Listing -and $needsListing) {
         $Listing = Get-ArchiveListing -ArchivePath $Entry.Path -ArchiveKey $ArchiveKey
     }
 
