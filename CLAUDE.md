@@ -61,7 +61,7 @@ The pipeline depth and smart-extract behaviour varies by script:
 
 **Archive entrypoint detection** (`Get-ArchiveEntrypoints` in `yecgaa_fixed.ps1` / `FLYYZ_fixed.ps1`): scans all files once and classifies them as `zip`, `7z`, `zip-z` (PKZIP split via `.z01`), `zip-001`, `7z-001`, `rar`, `rar-part`, or `rar-r00`. Only the first volume of each split set is emitted.
 
-**DORO/PADIO classifier** (`DORO_PADIO.ps1`): initial files are classified before extraction. Names containing `doro` use password `doro` and the three-stage DORO pipeline. Four-digit base names such as `1772.mp4` use password `PADIO294` and the two-stage PADIO pipeline. Unknown names are skipped rather than guessed.
+**DORO/PADIO classifier** (`DORO_PADIO.ps1`): initial files are classified before extraction. Names containing `doro` use password `doro` and the three-stage DORO pipeline. Four-digit base names such as `1772.mp4` use password `PADIO294` and the two-stage PADIO pipeline. Unknown names open an arrow-key menu so the user can choose DORO, PADIO, or Skip; manual choices made before `.mp4` → `.zip` are cached for the renamed archive so the script does not ask twice.
 
 **Intermediate directory isolation** (`DORO_PADIO.ps1`): intermediate extractions never flatten into `output0/` or `output1/`. Stage 0 extracts to `output0/<entry-name>/`; the DORO middle layer extracts each archive to `output1/<entry-name>/<archive-name>/`. The final layer is the only layer that uses smart extract into `output/`.
 
