@@ -20,6 +20,9 @@ Scripts are run from PowerShell 7 (`pwsh`). They also work under Windows PowerSh
 # Mixed DORO/PADIO batch: auto-classifies by file name before extracting
 .\DORO_PADIO.ps1
 
+# Mixed FLYYZ/yecgaa batch: asks per file via arrow-key menu, renames to F_xx / Y_xx
+.\FLYYZ_yecgaa.ps1
+
 # Unified menu: pick the source interactively, then runs the matching pipeline
 .\extract.ps1
 ```
@@ -53,6 +56,7 @@ The pipeline depth and final-placement behaviour varies by script (all stages us
 | `yejiang.ps1` | mp4 → output0\name → output | 2 | smart¹ | zip/7z/rar/all splits |
 | `DORO.ps1` | mp4 → output0\name → output1\name\archive → output | 3 | smart¹ | zip/7z/rar/all splits |
 | `DORO_PADIO.ps1` | classified: PADIO (depth 2) or DORO (depth 3) | 2/3 | smart¹ | zip/7z/rar/all splits |
+| `FLYYZ_yecgaa.ps1` | manual classify, renumber: mp4 → F_xx/Y_xx.zip → output0\<source>\F_xx → output\F_xx | 2 | fixed numbered dir (`output\F_xx`) | zip/7z/rar/all splits |
 | `c291dGhwbHVz.ps1` | direct to output\<rel-path> (no mp4 rename) | 1 | structure-preserving (rel path) | zip/7z/rar/all splits |
 | `yejiang_split_steps_step3_mode.ps1` | mp4 → output0\<rel>\name → output | 2 | structure-preserving, or flatten if `$step3Flatten` | zip/7z/rar/all splits |
 | `extract.ps1` | unified menu → standard / three-stage / direct / yejiang sub-modes | 1–3 | per chosen pipeline | zip/7z/rar/all splits |
@@ -76,6 +80,8 @@ The pipeline depth and final-placement behaviour varies by script (all stages us
 **Steganographier MP4 disguise**: ordinary SteganographierGUI `mp4` output is cover-video bytes followed by appended ZIP data, so stage 0 must rename `.mp4` → `.zip` and extract with WinRAR. Do not reintroduce 7z anywhere in these scripts: 7z can fail to read these disguised inputs (and mis-handles the header-encrypted inner archives) even though WinRAR extracts them correctly.
 
 **DORO/PADIO classifier** (`DORO_PADIO.ps1`): initial files are classified before extraction. Names containing `doro` use password `doro` and the three-stage DORO pipeline. Four-digit base names such as `1772.mp4` use password `PADIO294` and the two-stage PADIO pipeline. Unknown names open an arrow-key menu so the user can choose DORO, PADIO, or Skip; manual choices made before `.mp4` → `.zip` are cached for the renamed archive so the script does not ask twice.
+
+**FLYYZ/yecgaa manual classifier** (`FLYYZ_yecgaa.ps1`): every scanned `.mp4` is classified manually via the arrow-key menu (FLYYZ / yecgaa / Skip) — there is no name-based auto-detection for fresh files. All files are asked first, then renamed during the `.mp4` → `.zip` unmask to per-group sequence names (`F_1.zip`, `Y_1.zip`, …); the zero-padding width is the digit count of the group's own total (10+ files in a group → `F_01`, 100+ → `F_001`), and numbering restarts at 1 each run. Stage 0 extracts to `output0\FLYYZ\F_xx\` / `output0\yecgaa\Y_xx\`; the final layer extracts every archive found there into one fixed `output\F_xx\` directory (`Expand-ArchiveIntoNamedDir`: isolated temp dir + empty-guard, then all content moved in — no smart placement). Passwords stay per group (`F_*` → `FLYYZ`, `Y_*` → `yecgaa`). A leftover `output\F_xx` from an earlier batch is avoided via the `__2` suffix; renamed-but-failed `F_*`/`Y_*` archives are re-classified by name prefix on rerun, and resume scans `output0\<group>\<name>` dirs.
 
 **Unified menu** (`extract.ps1`): one script wraps the whole engine behind an arrow-key menu (`Show-Menu`). Selecting a source sets the password/junk-file config and dispatches to one of four pipeline orchestrators — `standard` (depth 2, PADIO/FLYYZ/yecgaa), `three-stage` (depth 3, DORO), `direct` (depth 1, c291), or `yejiang` (a sub-menu: `simple` = depth-2 smart, `split-structured` = structure-preserving, `split-flatten` = flatten to `output\`). All four share the same WinRAR engine, empty-guard, and chain-scoped deletion as the standalone scripts.
 
