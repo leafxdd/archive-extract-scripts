@@ -45,6 +45,7 @@
 | `yejiang.ps1` | `yejiang` | 2 | mp4 → output0 → output | 🧠 智能落位 |
 | `DORO.ps1` | `doro` | 3 | mp4 → output0 → output1 → output | 🧠 智能落位 |
 | `DORO_PADIO.ps1` | `doro` / `PADIO294` | 2/3 | 按文件名分类后走 PADIO 或 DORO 管线 | 🧠 智能落位 |
+| `FLYYZ_yecgaa.ps1` | `FLYYZ` / `yecgaa` | 2 | 逐个手动分类，改名 F_xx / Y_xx → output0\来源 → output\编号名 | 🔢 编号目录 |
 | `c291dGhwbHVz.ps1` | `c291dGhwbHVz` | 1 | 直接解压到 output（按相对路径，不改名 mp4） | 🗂️ 结构保留 |
 | `yejiang_split_steps_step3_mode.ps1` | `yejiang` | 2 | mp4 → output0 → output | 🗂️ 结构保留 / 扁平化 |
 | `extract.ps1` | 见菜单 | 1–3 | 统一菜单分发到各管线 | 视所选管线而定 |
@@ -157,6 +158,7 @@ Drop the `.mp4` / archive files into the script's directory, then run:
 | `yejiang.ps1` | `yejiang` | 2 | mp4 → output0 → output | 🧠 smart |
 | `DORO.ps1` | `doro` | 3 | mp4 → output0 → output1 → output | 🧠 smart |
 | `DORO_PADIO.ps1` | `doro` / `PADIO294` | 2/3 | classified into the PADIO or DORO pipeline | 🧠 smart |
+| `FLYYZ_yecgaa.ps1` | `FLYYZ` / `yecgaa` | 2 | per-file manual classify, renamed F_xx / Y_xx → output0\source → output\number | 🔢 numbered dir |
 | `c291dGhwbHVz.ps1` | `c291dGhwbHVz` | 1 | direct to output (by relative path, no mp4 rename) | 🗂️ structure-preserving |
 | `yejiang_split_steps_step3_mode.ps1` | `yejiang` | 2 | mp4 → output0 → output | 🗂️ structure-preserving / flatten |
 | `extract.ps1` | see menu | 1–3 | unified menu dispatching to each pipeline | depends on chosen pipeline |
