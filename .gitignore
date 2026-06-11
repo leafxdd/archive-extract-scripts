@@ -15,3 +15,13 @@ output1/
 *.zip.[0-9][0-9][0-9]
 *.7z.[0-9][0-9][0-9]
 *.part*.rar
+
+# Local-only docs (not published to the public repo)
+CLAUDE.md
+AGENTS.md
+
+# Test artifacts / scratch files
+test/
+tests/
+_test*
+_fy*
