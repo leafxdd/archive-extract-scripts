@@ -405,7 +405,10 @@ foreach ($source in $sources) {
 
     # Step 3: 该源 output0 子树内的压缩包 -> output（平铺 / 保留结构）
     $step3Entries = @(Get-ArchiveEntrypoints -RootDir $r2.TargetDir)
-    $allOk = $true
+    $allOk = $step3Entries.Count -gt 0
+    if ($step3Entries.Count -eq 0) {
+        Write-Host "[STEP3] 未发现可解压的中间压缩包" -ForegroundColor Yellow
+    }
     foreach ($a in $step3Entries) {
         $chain.CleanupEntries = @($chain.CleanupEntries + $a)
         if ($step3Flatten) {
