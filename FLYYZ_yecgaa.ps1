@@ -138,6 +138,14 @@ function Show-Menu {
         return $Text
     }
 
+    function Test-ConsoleKeyAvailable {
+        try {
+            return [Console]::KeyAvailable
+        } catch {
+            return $false
+        }
+    }
+
     $allLines = @(" $Title ") + ($Options | ForEach-Object { "  > $_" })
     $maxWidth = ($allLines | ForEach-Object { Get-DisplayWidth -Text $_ } | Measure-Object -Maximum).Maximum
 
@@ -173,12 +181,30 @@ function Show-Menu {
             $helpText = Limit-ToDisplayWidth -Text "  Up/Down 选择，Enter 确认，Esc 跳过" -MaxWidth ([Math]::Max(1, $windowWidth - 1))
             Write-Host $helpText -ForegroundColor DarkGray
 
-            $key = [Console]::ReadKey($true)
-            switch ($key.Key) {
-                'UpArrow'   { $selected = if ($selected -gt 0) { $selected - 1 } else { $Options.Count - 1 } }
-                'DownArrow' { $selected = if ($selected -lt $Options.Count - 1) { $selected + 1 } else { 0 } }
-                'Enter'     { return $selected }
-                'Escape'    { return -1 }
+            $redraw = $false
+            while (-not $redraw) {
+                if ((Get-ConsoleWindowWidth) -ne $windowWidth) {
+                    $redraw = $true
+                    break
+                }
+
+                if (Test-ConsoleKeyAvailable) {
+                    $key = [Console]::ReadKey($true)
+                    switch ($key.Key) {
+                        'UpArrow' {
+                            $selected = if ($selected -gt 0) { $selected - 1 } else { $Options.Count - 1 }
+                            $redraw = $true
+                        }
+                        'DownArrow' {
+                            $selected = if ($selected -lt $Options.Count - 1) { $selected + 1 } else { 0 }
+                            $redraw = $true
+                        }
+                        'Enter'  { return $selected }
+                        'Escape' { return -1 }
+                    }
+                } else {
+                    Start-Sleep -Milliseconds 80
+                }
             }
         }
     } finally {
