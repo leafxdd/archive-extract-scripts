@@ -95,6 +95,46 @@ function Show-Menu {
         return $width
     }
 
+    function Get-ConsoleWindowWidth {
+        try {
+            $width = $Host.UI.RawUI.WindowSize.Width
+            if ($width -gt 0) { return $width }
+        } catch { }
+
+        try {
+            $width = [Console]::WindowWidth
+            if ($width -gt 0) { return $width }
+        } catch { }
+
+        return 80
+    }
+
+    function Limit-ToDisplayWidth {
+        param(
+            [string]$Text,
+            [int]$MaxWidth
+        )
+
+        if ($MaxWidth -le 0) { return "" }
+        if ((Get-DisplayWidth -Text $Text) -le $MaxWidth) { return $Text }
+
+        $suffix = "..."
+        $suffixWidth = Get-DisplayWidth -Text $suffix
+        if ($MaxWidth -le $suffixWidth) { return "." * $MaxWidth }
+
+        $targetWidth = $MaxWidth - $suffixWidth
+        $usedWidth = 0
+        $builder = [System.Text.StringBuilder]::new()
+        foreach ($char in $Text.ToCharArray()) {
+            $charWidth = Get-DisplayWidth -Text ([string]$char)
+            if (($usedWidth + $charWidth) -gt $targetWidth) { break }
+            [void]$builder.Append($char)
+            $usedWidth += $charWidth
+        }
+
+        return $builder.ToString() + $suffix
+    }
+
     function Pad-ToDisplayWidth {
         param([string]$Text, [int]$TargetWidth)
 
@@ -104,22 +144,35 @@ function Show-Menu {
         return $Text
     }
 
+    function Test-ConsoleKeyAvailable {
+        try {
+            return [Console]::KeyAvailable
+        } catch {
+            return $false
+        }
+    }
+
     $allLines = @(" $Title ") + ($Options | ForEach-Object { "  > $_" })
     $maxWidth = ($allLines | ForEach-Object { Get-DisplayWidth -Text $_ } | Measure-Object -Maximum).Maximum
-    $width = [Math]::Max($maxWidth + 2, 30)
 
     try {
         while ($true) {
+            $windowWidth = Get-ConsoleWindowWidth
+            $maxInnerWidth = [Math]::Max(1, $windowWidth - 3)
+            $desiredWidth = [Math]::Max($maxWidth + 2, 30)
+            $width = [Math]::Min($desiredWidth, $maxInnerWidth)
+
             [Console]::Clear()
             $border = "$horizontal" * $width
             Write-Host "$topLeft$border$topRight" -ForegroundColor Cyan
-            $titleText = Pad-ToDisplayWidth -Text " $Title " -TargetWidth $width
+            $titleText = Pad-ToDisplayWidth -Text (Limit-ToDisplayWidth -Text " $Title " -MaxWidth $width) -TargetWidth $width
             Write-Host "$vertical$titleText$vertical" -ForegroundColor Cyan
             Write-Host "$middleLeft$border$middleRight" -ForegroundColor Cyan
 
             for ($i = 0; $i -lt $Options.Count; $i++) {
                 $marker = if ($i -eq $selected) { '>' } else { ' ' }
-                $text = Pad-ToDisplayWidth -Text "  $marker $($Options[$i])" -TargetWidth $width
+                $optionText = Limit-ToDisplayWidth -Text "  $marker $($Options[$i])" -MaxWidth $width
+                $text = Pad-ToDisplayWidth -Text $optionText -TargetWidth $width
                 Write-Host "$vertical" -NoNewline -ForegroundColor Cyan
                 if ($i -eq $selected) {
                     Write-Host $text -NoNewline -ForegroundColor Green
@@ -131,14 +184,33 @@ function Show-Menu {
 
             Write-Host "$bottomLeft$border$bottomRight" -ForegroundColor Cyan
             Write-Host ""
-            Write-Host "  Up/Down 选择，Enter 确认，Esc 跳过" -ForegroundColor DarkGray
+            $helpText = Limit-ToDisplayWidth -Text "  Up/Down 选择，Enter 确认，Esc 跳过" -MaxWidth ([Math]::Max(1, $windowWidth - 1))
+            Write-Host $helpText -ForegroundColor DarkGray
 
-            $key = [Console]::ReadKey($true)
-            switch ($key.Key) {
-                'UpArrow'   { $selected = if ($selected -gt 0) { $selected - 1 } else { $Options.Count - 1 } }
-                'DownArrow' { $selected = if ($selected -lt $Options.Count - 1) { $selected + 1 } else { 0 } }
-                'Enter'     { return $selected }
-                'Escape'    { return -1 }
+            $redraw = $false
+            while (-not $redraw) {
+                if ((Get-ConsoleWindowWidth) -ne $windowWidth) {
+                    $redraw = $true
+                    break
+                }
+
+                if (Test-ConsoleKeyAvailable) {
+                    $key = [Console]::ReadKey($true)
+                    switch ($key.Key) {
+                        'UpArrow' {
+                            $selected = if ($selected -gt 0) { $selected - 1 } else { $Options.Count - 1 }
+                            $redraw = $true
+                        }
+                        'DownArrow' {
+                            $selected = if ($selected -lt $Options.Count - 1) { $selected + 1 } else { 0 }
+                            $redraw = $true
+                        }
+                        'Enter'  { return $selected }
+                        'Escape' { return -1 }
+                    }
+                } else {
+                    Start-Sleep -Milliseconds 80
+                }
             }
         }
     } finally {
