@@ -391,8 +391,8 @@ $excludeDirs = @($Output0, $Output)
 # STEP 1: mp4 -> zip
 Write-Host "[STEP 1] 递归查找 .mp4 -> 重命名为 .zip（不在此步解压）" -ForegroundColor Cyan
 Write-Host ""
-$mp4Files = @(Get-ChildItem -LiteralPath $scriptDir -Recurse -File -Force -ErrorAction SilentlyContinue |
-    Where-Object { $_.Extension -ieq '.mp4' -and -not (Test-IsUnderAnyPath -ChildPath $_.FullName -ParentPaths $excludeDirs) })
+$mp4Files = @(Get-FilesWithPrunedDirs -RootDir $scriptDir -ExcludeDirs $excludeDirs |
+    Where-Object { $_.Extension -ieq '.mp4' })
 foreach ($file in $mp4Files) {
     $desiredZipPath = Join-Path $file.DirectoryName ($file.BaseName + ".zip")
     $zipPath = Get-UniqueFilePath -FilePath $desiredZipPath

@@ -571,8 +571,8 @@ function Expand-ArchiveFlatten {
 function Convert-Mp4ToZip {
     param([string[]]$ExcludeDirs)
 
-    $mp4Files = @(Get-ChildItem -LiteralPath $WorkDir -Recurse -File -Force -ErrorAction SilentlyContinue |
-        Where-Object { $_.Extension -ieq '.mp4' -and -not (Test-IsUnderAnyPath -ChildPath $_.FullName -ParentPaths $ExcludeDirs) })
+    $mp4Files = @(Get-FilesWithPrunedDirs -RootDir $WorkDir -ExcludeDirs $ExcludeDirs |
+        Where-Object { $_.Extension -ieq '.mp4' })
 
     foreach ($file in $mp4Files) {
         $desiredZipPath = Join-Path $file.DirectoryName ($file.BaseName + ".zip")

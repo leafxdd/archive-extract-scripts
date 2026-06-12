@@ -719,12 +719,8 @@ function Expand-ArchiveSmartFinal {
 function Convert-ClassifiedMp4ToZip {
     param([string[]]$ExcludeDirs)
 
-    $mp4Files = @(Get-ChildItem -LiteralPath $WorkDir -Recurse -File -Force -ErrorAction SilentlyContinue |
-        Where-Object {
-            $candidate = $_.FullName
-            $_.Extension -ieq '.mp4' -and
-            -not (Test-IsUnderAnyPath -ChildPath $candidate -ParentPaths $ExcludeDirs)
-        })
+    $mp4Files = @(Get-FilesWithPrunedDirs -RootDir $WorkDir -ExcludeDirs $ExcludeDirs |
+        Where-Object { $_.Extension -ieq '.mp4' })
 
     foreach ($file in $mp4Files) {
         $archiveProfile = Resolve-ArchiveProfile -BaseName $file.BaseName -DisplayName $file.Name -FullPath $file.FullName -PromptIfUnknown

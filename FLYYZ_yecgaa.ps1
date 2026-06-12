@@ -590,8 +590,8 @@ function Expand-ArchiveIntoNamedDir {
 function Convert-ClassifiedMp4ToZip {
     param([string[]]$ExcludeDirs)
 
-    $mp4Files = @(Get-ChildItem -LiteralPath $WorkDir -Recurse -File -Force -ErrorAction SilentlyContinue |
-        Where-Object { $_.Extension -ieq '.mp4' -and -not (Test-IsUnderAnyPath -ChildPath $_.FullName -ParentPaths $ExcludeDirs) })
+    $mp4Files = @(Get-FilesWithPrunedDirs -RootDir $WorkDir -ExcludeDirs $ExcludeDirs |
+        Where-Object { $_.Extension -ieq '.mp4' })
 
     if ($mp4Files.Count -eq 0) {
         Write-Host "未发现待分类的 .mp4 文件" -ForegroundColor Gray
