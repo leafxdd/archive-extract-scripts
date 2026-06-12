@@ -528,8 +528,73 @@ function Complete-WinRARExtract {
     return $true
 }
 
+# 源压缩包总字节数（分卷计全组，分组模式与 Remove-ArchiveGroup 一致），仅用于进度估算。
+function Get-ArchiveGroupBytes {
+    param([Parameter(Mandatory)][pscustomobject]$Entry)
+
+    $total = [long]0
+    try {
+        $groupPattern = switch -Regex ($Entry.Type) {
+            '^(zip-z|zip-z01)$' { '^{0}\.z\d+$' -f [regex]::Escape($Entry.Base) }
+            '^(zip|7z)-001$'    { '^{0}\.{1}\.\d+$' -f [regex]::Escape($Entry.Base), (($Entry.Type -split '-')[0]) }
+            '^rar-part$'        { '^{0}\.part\d+\.rar$' -f [regex]::Escape($Entry.Base) }
+            '^rar-r00$'         { '^{0}\.r\d\d$' -f [regex]::Escape($Entry.Base) }
+            default             { $null }
+        }
+        if ($groupPattern) {
+            foreach ($f in @(Get-ChildItem -LiteralPath $Entry.Dir -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match $groupPattern })) { $total += $f.Length }
+        }
+        # 主卷不在组模式内时单独计入（zip-z 的 .zip 主卷、rar-r00 的 .rar 主卷、所有单文件档）
+        if ((-not $groupPattern -or (Split-Path -Leaf $Entry.Path) -notmatch $groupPattern) -and (Test-Path -LiteralPath $Entry.Path)) {
+            $total += (Get-Item -LiteralPath $Entry.Path -Force -ErrorAction SilentlyContinue).Length
+        }
+    } catch { }
+    return $total
+}
+
+# 解压进度（仅估算显示）：已解出字节 ÷ 源压缩包字节。本仓库内容多为已压缩媒体（接近 store 存储），
+# 估算接近真实；压缩比偏离 1 时仅供参考，上限钳 99%。成败判定与本函数无关，一律以退出码 + 空解压防护为准。
+# "当前文件"取目标目录里创建时间最新的文件——WinRAR 解压完成会把修改时间恢复为档内时间戳，
+# 创建时间才反映真实解压时刻。
+function Show-ExtractionProgress {
+    param([object[]]$InFlightItems = @())
+
+    foreach ($item in $InFlightItems) {
+        $done = [long]0
+        $latest = $null
+        $latestTime = [datetime]::MinValue
+        try {
+            $dirInfo = [System.IO.DirectoryInfo]::new($item.ExtractJob.TargetDir)
+            foreach ($f in $dirInfo.EnumerateFiles('*', [System.IO.SearchOption]::AllDirectories)) {
+                $done += $f.Length
+                if ($f.CreationTimeUtc -gt $latestTime) { $latestTime = $f.CreationTimeUtc; $latest = $f.Name }
+            }
+        } catch { }
+        $pct = if ($item.TotalBytes -gt 0) { [Math]::Min(99, [int](100 * $done / $item.TotalBytes)) } else { 0 }
+        $status = "约 {0}%（{1:N1} / {2:N1} MB）" -f $pct, ($done / 1MB), ($item.TotalBytes / 1MB)
+        if ($latest) { $status += " · $latest" }
+        Write-Progress -Id $item.ProgressId -Activity $item.Label -Status $status -PercentComplete $pct
+    }
+}
+
+# 收割在飞队列的队头任务：等待其进程退出（期间每 300ms 刷新全部在飞任务的进度条）并校验结果。
+function Complete-OldestExtraction {
+    param([Parameter(Mandatory)][System.Collections.Generic.Queue[object]]$InFlight)
+
+    $oldest = $InFlight.Peek()
+    $proc = $oldest.ExtractJob.Proc
+    while ($null -ne $proc -and -not $proc.WaitForExit(300)) {
+        Show-ExtractionProgress -InFlightItems $InFlight.ToArray()
+    }
+    [void]$InFlight.Dequeue()
+    Write-Progress -Id $oldest.ProgressId -Activity $oldest.Label -Completed
+    $ok = Complete-WinRARExtract -ExtractJob $oldest.ExtractJob
+    return [pscustomobject]@{ Task = $oldest.Task; Success = $ok }
+}
+
 # 批量解压调度：窗口内最多 ThrottleLimit 个 WinRAR 并发，结果严格按提交顺序收割。
 # ThrottleLimit=1 时退化为"启动→等待→下一个"，与逐个同步解压完全等价。
+# 等待期间以 Write-Progress 显示各在飞任务的估算进度（百分比 + 当前解压文件）。
 # 任务对象需含 Entry / TargetDir / ArchiveKey（TargetDir 必须是调用方预创建的唯一隔离目录），
 # 返回 [{ Task; Success }]，顺序与输入一致。所有移动/删除等落位操作由调用方在收割后串行执行。
 function Invoke-ExtractionBatch {
@@ -542,21 +607,27 @@ function Invoke-ExtractionBatch {
     $limit = [Math]::Max(1, $ThrottleLimit)
     $results = New-Object 'System.Collections.Generic.List[object]'
     $inFlight = New-Object 'System.Collections.Generic.Queue[object]'
+    $submitted = 0
 
     foreach ($task in $Tasks) {
         while ($inFlight.Count -ge $limit) {
-            $oldest = $inFlight.Dequeue()
-            $ok = Complete-WinRARExtract -ExtractJob $oldest.ExtractJob
-            $results.Add([pscustomobject]@{ Task = $oldest.Task; Success = $ok })
+            $results.Add((Complete-OldestExtraction -InFlight $inFlight))
         }
+        $submitted++
         Write-Host "[EXTRACT] ($(Get-EntryLabel -Entry $task.Entry)) $(Split-Path -Leaf $task.Entry.Path) -> $($task.TargetDir)" -ForegroundColor Yellow
         $extractJob = Start-WinRARExtract -ArchivePath $task.Entry.Path -TargetDir $task.TargetDir -ArchiveKey $task.ArchiveKey
-        $inFlight.Enqueue([pscustomobject]@{ Task = $task; ExtractJob = $extractJob })
+        $label = "解压 [{0}/{1}] {2}" -f $submitted, $Tasks.Count, (Split-Path -Leaf $task.Entry.Path)
+        $totalBytes = Get-ArchiveGroupBytes -Entry $task.Entry
+        $inFlight.Enqueue([pscustomobject]@{
+            Task       = $task
+            ExtractJob = $extractJob
+            ProgressId = $submitted
+            Label      = $label
+            TotalBytes = $totalBytes
+        })
     }
     while ($inFlight.Count -gt 0) {
-        $oldest = $inFlight.Dequeue()
-        $ok = Complete-WinRARExtract -ExtractJob $oldest.ExtractJob
-        $results.Add([pscustomobject]@{ Task = $oldest.Task; Success = $ok })
+        $results.Add((Complete-OldestExtraction -InFlight $inFlight))
     }
 
     return $results.ToArray()
