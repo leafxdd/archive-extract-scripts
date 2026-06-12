@@ -97,7 +97,9 @@
 
 - 🔗 **链式清理（chain-scoped cleanup）**：绝不在单步解压成功后就急着删源文件。每个初始源都带一条清理链，记录其改名后的源压缩包与由它衍生的全部中间/最终压缩包，只有整条链所需的各阶段都成功才删除；失败的链会保留源文件和中间压缩包以便排查。在层数 3 的管线里，中间层失败会直接跳过最终层。
 
-- 🧩 **智能落位**（`Expand-ArchiveSmartFinal`）：WinRAR 无法把压缩包内容列到标准输出，于是先把它解压进 `output\` 下的隔离临时目录再检查结构——若顶层至少含一个文件夹，就把每个顶层条目直接移入 `output\`；若顶层全是散落文件，则把临时目录改名为同名子目录，避免文件散落一地。
+- 🧩 **智能落位**（`Move-SmartExtractedContent`）：WinRAR 无法把压缩包内容列到标准输出，于是先把它解压进 `output\` 下的隔离临时目录再检查结构——若顶层至少含一个文件夹，就把每个顶层条目直接移入 `output\`；若顶层全是散落文件，则把临时目录改名为同名子目录，避免文件散落一地。
+
+- ⚡ **并行解压**（`Invoke-ExtractionBatch`）：`-Parallel N` 时最多 N 个 WinRAR 进程同时解压，结果严格按提交顺序收割；并行的只有解压本身，目录预分配、落位、删除等所有「检查再动作」步骤始终留在主线程串行执行，并行度 1 时与逐个串行完全等价。
 
 - ⏯️ **断点续传**：若上次运行已完成阶段 0、之后才失败，重跑时会扫描仍含压缩包的 `output0\<条目名>\` 目录并作为阶段 0 任务续跑，免去手动恢复已删除源 `.zip` 的麻烦。
 
@@ -215,7 +217,9 @@ Every script follows the same mental model:
 
 - 🔗 **Chain-scoped cleanup**: never delete source archives right after one step succeeds. Each initial source carries a cleanup chain tracking its renamed source archive plus every intermediate/final archive derived from it; it is deleted only after all required stages succeed. Failed chains keep their source and intermediate archives for debugging. In the depth-3 pipeline, a failed middle layer skips the final layer entirely.
 
-- 🧩 **Smart placement** (`Expand-ArchiveSmartFinal`): WinRAR can't list an archive's contents to stdout, so it extracts into an isolated temp dir under `output\` first and inspects the structure — if the top level has at least one folder, each top-level item is moved into `output\`; if it's all loose files, the temp dir is renamed to a same-name subdirectory to avoid scattering files.
+- 🧩 **Smart placement** (`Move-SmartExtractedContent`): WinRAR can't list an archive's contents to stdout, so it extracts into an isolated temp dir under `output\` first and inspects the structure — if the top level has at least one folder, each top-level item is moved into `output\`; if it's all loose files, the temp dir is renamed to a same-name subdirectory to avoid scattering files.
+
+- ⚡ **Parallel extraction** (`Invoke-ExtractionBatch`): with `-Parallel N`, up to N WinRAR processes extract concurrently and results are harvested strictly in submission order; only the extraction itself runs in parallel — directory preallocation, placement, and deletion (every check-then-act step) always stay serial on the main thread, and parallelism 1 is exactly equivalent to the serial path.
 
 - ⏯️ **Resume**: if a prior run finished stage 0 and only failed later, a rerun scans `output0\<entry-name>\` dirs that still contain archives and resumes them as stage-0 jobs — no need to manually restore already-deleted source `.zip` files.
 
