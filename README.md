@@ -101,6 +101,8 @@
 
 - ⚡ **并行解压**（`Invoke-ExtractionBatch`）：`-Parallel N` 时最多 N 个 WinRAR 进程同时解压，结果严格按提交顺序收割；并行的只有解压本身，目录预分配、落位、删除等所有「检查再动作」步骤始终留在主线程串行执行，并行度 1 时与逐个串行完全等价。
 
+- 📊 **估算进度条**（`Show-ExtractionProgress`）：WinRAR.exe 是 GUI 程序，不会向控制台输出任何进度。引擎在等待解压进程退出期间每 300ms 用 `Write-Progress` 刷新进度条（并行时每路一条）——百分比按「已解出字节 ÷ 源压缩包字节（分卷计全组）」估算、上限钳 99%，并附上最近解出的文件名。内容多为已压缩媒体（接近 store 存储），估算接近真实；进度仅供观察，成败判定仍以退出码 + 空解压防护为准。
+
 - ⏯️ **断点续传**：若上次运行已完成阶段 0、之后才失败，重跑时会扫描仍含压缩包的 `output0\<条目名>\` 目录并作为阶段 0 任务续跑，免去手动恢复已删除源 `.zip` 的麻烦。
 
 - 🔒 **路径安全 & 不覆盖**：全程使用 `-LiteralPath`，正确处理含 `[` `]`、中文、空格等字符的文件名；目标目录冲突时加 `__2`/`__3` 后缀，落位冲突时把既有项改名为 `__existing_2` 等再移入；WinRAR 以 `-or` 调用作为第二道保险。
@@ -220,6 +222,8 @@ Every script follows the same mental model:
 - 🧩 **Smart placement** (`Move-SmartExtractedContent`): WinRAR can't list an archive's contents to stdout, so it extracts into an isolated temp dir under `output\` first and inspects the structure — if the top level has at least one folder, each top-level item is moved into `output\`; if it's all loose files, the temp dir is renamed to a same-name subdirectory to avoid scattering files.
 
 - ⚡ **Parallel extraction** (`Invoke-ExtractionBatch`): with `-Parallel N`, up to N WinRAR processes extract concurrently and results are harvested strictly in submission order; only the extraction itself runs in parallel — directory preallocation, placement, and deletion (every check-then-act step) always stay serial on the main thread, and parallelism 1 is exactly equivalent to the serial path.
+
+- 📊 **Estimated progress bars** (`Show-ExtractionProgress`): WinRAR.exe is a GUI-subsystem program and never writes progress to the console. While waiting for an extraction process, the engine refreshes a `Write-Progress` bar every 300ms (one per in-flight task) — the percentage is estimated as extracted bytes ÷ source archive bytes (split sets counted whole), capped at 99%, plus the most recently extracted file name. Content is mostly already-compressed media (near-store), so the estimate stays close to reality; progress is display-only — success is still judged solely by exit code + the empty-extraction guard.
 
 - ⏯️ **Resume**: if a prior run finished stage 0 and only failed later, a rerun scans `output0\<entry-name>\` dirs that still contain archives and resumes them as stage-0 jobs — no need to manually restore already-deleted source `.zip` files.
 
