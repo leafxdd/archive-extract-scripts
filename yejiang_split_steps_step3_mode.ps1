@@ -161,23 +161,54 @@ function Get-EntryLabel {
 }
 
 # ==================== 压缩包入口检测 ====================
-function Get-ArchiveEntrypoints {
-    param([Parameter(Mandatory)][string]$RootDir, [string[]]$ExcludeDirs = @())
+# 剪枝枚举：递归列出 RootDir 下所有文件；位于 ExcludeDirs 内的目录整棵跳过（不进入）。
+# 与"全量枚举后逐文件过滤"产出相同集合，但被排除子树（如积累大量产物的 output\）完全不被遍历。
+function Get-FilesWithPrunedDirs {
+    param(
+        [Parameter(Mandatory)][string]$RootDir,
+        [string[]]$ExcludeDirs = @()
+    )
 
-    $excludeNorm = @($ExcludeDirs | ForEach-Object { Get-NormalizedPath $_ })
-    $allFiles = @(Get-ChildItem -LiteralPath $RootDir -Recurse -File -Force -ErrorAction SilentlyContinue)
+    $excludeNorm = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($ex in $ExcludeDirs) {
+        if ($ex) { [void]$excludeNorm.Add((Get-NormalizedPath $ex)) }
+    }
+
+    if ($excludeNorm.Count -eq 0) {
+        return @(Get-ChildItem -LiteralPath $RootDir -Recurse -File -Force -ErrorAction SilentlyContinue)
+    }
+
+    $files = New-Object 'System.Collections.Generic.List[object]'
+    $queue = New-Object 'System.Collections.Generic.Queue[string]'
+    $queue.Enqueue($RootDir)
+    while ($queue.Count -gt 0) {
+        $dir = $queue.Dequeue()
+        foreach ($item in @(Get-ChildItem -LiteralPath $dir -Force -ErrorAction SilentlyContinue)) {
+            if ($item.PSIsContainer) {
+                # reparse point（junction/符号链接）不进入：防循环，与 pwsh7 -Recurse 默认行为一致
+                if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { continue }
+                if (-not $excludeNorm.Contains((Get-NormalizedPath -Path $item.FullName))) { $queue.Enqueue($item.FullName) }
+            } else {
+                $files.Add($item)
+            }
+        }
+    }
+    return $files.ToArray()
+}
+
+function Get-ArchiveEntrypoints {
+    param(
+        [Parameter(Mandatory)][string]$RootDir,
+        [string[]]$ExcludeDirs = @()
+    )
+
+    $allFiles = @(Get-FilesWithPrunedDirs -RootDir $RootDir -ExcludeDirs $ExcludeDirs)
     if ($allFiles.Count -eq 0) { return @() }
 
-    $entries = @()
+    $entries = New-Object 'System.Collections.Generic.List[object]'
     $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
 
     foreach ($file in $allFiles) {
-        $skip = $false
-        foreach ($ex in $excludeNorm) {
-            if ($ex -and (Test-IsUnderPath -ChildPath $file.FullName -ParentPath $ex)) { $skip = $true; break }
-        }
-        if ($skip) { continue }
-
         $name = $file.Name
         $full = $file.FullName
 
@@ -186,12 +217,12 @@ function Get-ArchiveEntrypoints {
                 $partNum = 0
                 [void][int]::TryParse($Matches.part, [ref]$partNum)
                 if ($partNum -ne 1) { continue }
-                if ($seen.Add($full)) { $entries += [pscustomobject]@{ Path = $full; Type = 'rar-part'; Dir = $file.DirectoryName; Base = $Matches.stem } }
+                if ($seen.Add($full)) { $entries.Add([pscustomobject]@{ Path = $full; Type = 'rar-part'; Dir = $file.DirectoryName; Base = $Matches.stem }) }
                 continue
             }
             $r00 = Join-Path $file.DirectoryName ($file.BaseName + '.r00')
             $type = if (Test-Path -LiteralPath $r00) { 'rar-r00' } else { 'rar' }
-            if ($seen.Add($full)) { $entries += [pscustomobject]@{ Path = $full; Type = $type; Dir = $file.DirectoryName; Base = $file.BaseName } }
+            if ($seen.Add($full)) { $entries.Add([pscustomobject]@{ Path = $full; Type = $type; Dir = $file.DirectoryName; Base = $file.BaseName }) }
             continue
         }
 
@@ -202,7 +233,7 @@ function Get-ArchiveEntrypoints {
                 $isZipSplitZ = Test-Path -LiteralPath $z01
             }
             $type = if ($isZipSplitZ) { 'zip-z' } else { $file.Extension.TrimStart('.') }
-            if ($seen.Add($full)) { $entries += [pscustomobject]@{ Path = $full; Type = $type; Dir = $file.DirectoryName; Base = $file.BaseName } }
+            if ($seen.Add($full)) { $entries.Add([pscustomobject]@{ Path = $full; Type = $type; Dir = $file.DirectoryName; Base = $file.BaseName }) }
             continue
         }
 
@@ -212,7 +243,7 @@ function Get-ArchiveEntrypoints {
             if ($partNum -ne 1) { continue }
             $fmt = $Matches.fmt.ToLowerInvariant()
             $type = "$fmt-001"
-            if ($seen.Add($full)) { $entries += [pscustomobject]@{ Path = $full; Type = $type; Dir = $file.DirectoryName; Base = $Matches.stem } }
+            if ($seen.Add($full)) { $entries.Add([pscustomobject]@{ Path = $full; Type = $type; Dir = $file.DirectoryName; Base = $Matches.stem }) }
             continue
         }
 
@@ -222,15 +253,15 @@ function Get-ArchiveEntrypoints {
             if ($partNum -ne 1) { continue }
             $zipCandidate = Join-Path $file.DirectoryName ($Matches.stem + '.zip')
             if (Test-Path -LiteralPath $zipCandidate) {
-                if ($seen.Add($zipCandidate)) { $entries += [pscustomobject]@{ Path = $zipCandidate; Type = 'zip-z'; Dir = $file.DirectoryName; Base = $Matches.stem } }
+                if ($seen.Add($zipCandidate)) { $entries.Add([pscustomobject]@{ Path = $zipCandidate; Type = 'zip-z'; Dir = $file.DirectoryName; Base = $Matches.stem }) }
             } else {
-                if ($seen.Add($full)) { $entries += [pscustomobject]@{ Path = $full; Type = 'zip-z01'; Dir = $file.DirectoryName; Base = $Matches.stem } }
+                if ($seen.Add($full)) { $entries.Add([pscustomobject]@{ Path = $full; Type = 'zip-z01'; Dir = $file.DirectoryName; Base = $Matches.stem }) }
             }
             continue
         }
     }
 
-    return @($entries)
+    return $entries.ToArray()
 }
 
 function Remove-ArchiveGroup {
