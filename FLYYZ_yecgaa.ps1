@@ -472,11 +472,12 @@ function Invoke-WinRARExtract {
     )
 
     New-DirectoryIfMissing -Path $TargetDir
-    # WinRAR.exe 是 GUI 程序，必须 Start-Process -Wait 才能拿到真实退出码；-or = 同名自动改名兜底。
+    # WinRAR.exe 是 GUI 程序，必须 Start-Process -Wait 才能拿到真实退出码；-or = 同名自动改名兜底；-inul = 禁错误弹窗，防无人值守卡死。
     $proc = Start-Process -FilePath $WinRarExe -ArgumentList @(
         'x',
         "-p$ArchiveKey",
         '-ibck',
+        '-inul',
         '-y',
         '-or',
         "`"$ArchivePath`"",

@@ -280,7 +280,7 @@ function Invoke-WinRARExtract {
 
     New-DirectoryIfMissing -Path $TargetDir
     $proc = Start-Process -FilePath $WinRarExe -ArgumentList @(
-        'x', "-p$password", '-ibck', '-y', '-or',
+        'x', "-p$password", '-ibck', '-inul', '-y', '-or',
         "`"$ArchivePath`"", "`"$TargetDir\`""
     ) -Wait -PassThru -NoNewWindow
 

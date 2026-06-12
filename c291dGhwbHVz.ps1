@@ -261,6 +261,7 @@ function Invoke-WinRARExtract {
         'x',
         "-p$ArchiveKey",
         '-ibck',
+        '-inul',
         '-y',
         '-or',
         "`"$ArchivePath`"",
