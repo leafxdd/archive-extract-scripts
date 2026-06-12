@@ -62,21 +62,29 @@ $Profiles = [ordered]@{
 # ==================== 交互式菜单 ====================
 function Show-Menu {
     param(
-        [string]$Title,
-        [string[]]$Options
+        [Parameter(Mandatory)][string]$Title,
+        [Parameter(Mandatory)][string[]]$Options
     )
 
     $selected = 0
     $cursorVisible = [Console]::CursorVisible
     [Console]::CursorVisible = $false
 
-    $TL = [char]0x2554; $TR = [char]0x2557; $BL = [char]0x255A; $BR = [char]0x255D
-    $H  = [char]0x2550; $V  = [char]0x2551; $ML = [char]0x2560; $MR = [char]0x2563
+    $topLeft = [char]0x2554
+    $topRight = [char]0x2557
+    $bottomLeft = [char]0x255A
+    $bottomRight = [char]0x255D
+    $horizontal = [char]0x2550
+    $vertical = [char]0x2551
+    $middleLeft = [char]0x2560
+    $middleRight = [char]0x2563
 
-    function Get-DisplayWidth([string]$s) {
-        $w = 0
-        foreach ($c in $s.ToCharArray()) {
-            $code = [int]$c
+    function Get-DisplayWidth {
+        param([string]$Text)
+
+        $width = 0
+        foreach ($char in $Text.ToCharArray()) {
+            $code = [int]$char
             if (($code -ge 0x1100 -and $code -le 0x115F) -or
                 ($code -ge 0x2E80 -and $code -le 0xA4CF -and $code -ne 0x303F) -or
                 ($code -ge 0xAC00 -and $code -le 0xD7A3) -or
@@ -84,56 +92,130 @@ function Show-Menu {
                 ($code -ge 0xFE10 -and $code -le 0xFE6F) -or
                 ($code -ge 0xFF01 -and $code -le 0xFF60) -or
                 ($code -ge 0xFFE0 -and $code -le 0xFFE6)) {
-                $w += 2
-            } else { $w += 1 }
+                $width += 2
+            } else {
+                $width += 1
+            }
         }
-        return $w
+        return $width
     }
 
-    function Pad-ToDisplayWidth([string]$s, [int]$targetWidth) {
-        $dw = Get-DisplayWidth $s
-        $pad = $targetWidth - $dw
-        if ($pad -gt 0) { return $s + (' ' * $pad) }
-        return $s
+    function Get-ConsoleWindowWidth {
+        try {
+            $width = $Host.UI.RawUI.WindowSize.Width
+            if ($width -gt 0) { return $width }
+        } catch { }
+
+        try {
+            $width = [Console]::WindowWidth
+            if ($width -gt 0) { return $width }
+        } catch { }
+
+        return 80
+    }
+
+    function Limit-ToDisplayWidth {
+        param(
+            [string]$Text,
+            [int]$MaxWidth
+        )
+
+        if ($MaxWidth -le 0) { return "" }
+        if ((Get-DisplayWidth -Text $Text) -le $MaxWidth) { return $Text }
+
+        $suffix = "..."
+        $suffixWidth = Get-DisplayWidth -Text $suffix
+        if ($MaxWidth -le $suffixWidth) { return "." * $MaxWidth }
+
+        $targetWidth = $MaxWidth - $suffixWidth
+        $usedWidth = 0
+        $builder = [System.Text.StringBuilder]::new()
+        foreach ($char in $Text.ToCharArray()) {
+            $charWidth = Get-DisplayWidth -Text ([string]$char)
+            if (($usedWidth + $charWidth) -gt $targetWidth) { break }
+            [void]$builder.Append($char)
+            $usedWidth += $charWidth
+        }
+
+        return $builder.ToString() + $suffix
+    }
+
+    function Pad-ToDisplayWidth {
+        param([string]$Text, [int]$TargetWidth)
+
+        $displayWidth = Get-DisplayWidth -Text $Text
+        $pad = $TargetWidth - $displayWidth
+        if ($pad -gt 0) { return $Text + (' ' * $pad) }
+        return $Text
+    }
+
+    function Test-ConsoleKeyAvailable {
+        try {
+            return [Console]::KeyAvailable
+        } catch {
+            return $false
+        }
     }
 
     $allLines = @(" $Title ") + ($Options | ForEach-Object { "  > $_" })
-    $maxDW = ($allLines | ForEach-Object { Get-DisplayWidth $_ } | Measure-Object -Maximum).Maximum
-    $width = [Math]::Max($maxDW + 2, 30)
+    $maxWidth = ($allLines | ForEach-Object { Get-DisplayWidth -Text $_ } | Measure-Object -Maximum).Maximum
 
     try {
         while ($true) {
+            $windowWidth = Get-ConsoleWindowWidth
+            $maxInnerWidth = [Math]::Max(1, $windowWidth - 3)
+            $desiredWidth = [Math]::Max($maxWidth + 2, 30)
+            $width = [Math]::Min($desiredWidth, $maxInnerWidth)
+
             [Console]::Clear()
-            $border = "$H" * $width
-            Write-Host "$TL$border$TR" -ForegroundColor Cyan
-            $titleText = Pad-ToDisplayWidth " $Title " $width
-            Write-Host "$V$titleText$V" -ForegroundColor Cyan
-            Write-Host "$ML$border$MR" -ForegroundColor Cyan
+            $border = "$horizontal" * $width
+            Write-Host "$topLeft$border$topRight" -ForegroundColor Cyan
+            $titleText = Pad-ToDisplayWidth -Text (Limit-ToDisplayWidth -Text " $Title " -MaxWidth $width) -TargetWidth $width
+            Write-Host "$vertical$titleText$vertical" -ForegroundColor Cyan
+            Write-Host "$middleLeft$border$middleRight" -ForegroundColor Cyan
 
             for ($i = 0; $i -lt $Options.Count; $i++) {
                 $marker = if ($i -eq $selected) { '>' } else { ' ' }
-                $text = Pad-ToDisplayWidth "  $marker $($Options[$i])" $width
+                $optionText = Limit-ToDisplayWidth -Text "  $marker $($Options[$i])" -MaxWidth $width
+                $text = Pad-ToDisplayWidth -Text $optionText -TargetWidth $width
+                Write-Host "$vertical" -NoNewline -ForegroundColor Cyan
                 if ($i -eq $selected) {
-                    Write-Host "$V" -NoNewline -ForegroundColor Cyan
                     Write-Host $text -NoNewline -ForegroundColor Green
-                    Write-Host "$V" -ForegroundColor Cyan
                 } else {
-                    Write-Host "$V" -NoNewline -ForegroundColor Cyan
                     Write-Host $text -NoNewline -ForegroundColor White
-                    Write-Host "$V" -ForegroundColor Cyan
                 }
+                Write-Host "$vertical" -ForegroundColor Cyan
             }
 
-            Write-Host "$BL$border$BR" -ForegroundColor Cyan
+            Write-Host "$bottomLeft$border$bottomRight" -ForegroundColor Cyan
             Write-Host ""
-            Write-Host "  Up/Down to move, Enter to select, Esc to quit" -ForegroundColor DarkGray
+            $helpText = Limit-ToDisplayWidth -Text "  Up/Down 选择，Enter 确认，Esc 跳过" -MaxWidth ([Math]::Max(1, $windowWidth - 1))
+            Write-Host $helpText -ForegroundColor DarkGray
 
-            $key = [Console]::ReadKey($true)
-            switch ($key.Key) {
-                'UpArrow'   { $selected = if ($selected -gt 0) { $selected - 1 } else { $Options.Count - 1 } }
-                'DownArrow' { $selected = if ($selected -lt $Options.Count - 1) { $selected + 1 } else { 0 } }
-                'Enter'     { return $selected }
-                'Escape'    { return -1 }
+            $redraw = $false
+            while (-not $redraw) {
+                if ((Get-ConsoleWindowWidth) -ne $windowWidth) {
+                    $redraw = $true
+                    break
+                }
+
+                if (Test-ConsoleKeyAvailable) {
+                    $key = [Console]::ReadKey($true)
+                    switch ($key.Key) {
+                        'UpArrow' {
+                            $selected = if ($selected -gt 0) { $selected - 1 } else { $Options.Count - 1 }
+                            $redraw = $true
+                        }
+                        'DownArrow' {
+                            $selected = if ($selected -lt $Options.Count - 1) { $selected + 1 } else { 0 }
+                            $redraw = $true
+                        }
+                        'Enter'  { return $selected }
+                        'Escape' { return -1 }
+                    }
+                } else {
+                    Start-Sleep -Milliseconds 80
+                }
             }
         }
     } finally {
