@@ -854,6 +854,7 @@ function Get-ResumableStage0Jobs {
             Source    = $null
             Stage0Dir = $dir.FullName
             Name      = $dir.Name
+            CleanupEntries = @()
             Resumed   = $true
         }
     }
