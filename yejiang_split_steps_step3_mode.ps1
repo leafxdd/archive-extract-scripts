@@ -369,15 +369,47 @@ function Expand-ArchiveFlatten {
 }
 
 function Remove-EmptyDirs {
-    param([Parameter(Mandatory)][string]$Root, [string[]]$ProtectDirs = @())
-    $allDirs = @(Get-ChildItem -LiteralPath $Root -Directory -Recurse -Force -ErrorAction SilentlyContinue |
-        Where-Object { $dir = $_.FullName; -not ($ProtectDirs | Where-Object { Test-IsUnderPath -ChildPath $dir -ParentPath $_ }) } |
-        Sort-Object { $_.FullName.Split('\').Count } -Descending)
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [string[]]$ProtectDirs = @()
+    )
+
+    $protectNorm = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($p in $ProtectDirs) {
+        if ($p) { [void]$protectNorm.Add((Get-NormalizedPath $p)) }
+    }
+
+    # 收集时即跳过受保护子树与 reparse point，不再全量枚举后过滤
+    $allDirs = New-Object 'System.Collections.Generic.List[object]'
+    $queue = New-Object 'System.Collections.Generic.Queue[string]'
+    $queue.Enqueue($Root)
+    while ($queue.Count -gt 0) {
+        $dir = $queue.Dequeue()
+        foreach ($item in @(Get-ChildItem -LiteralPath $dir -Directory -Force -ErrorAction SilentlyContinue)) {
+            if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { continue }
+            if ($protectNorm.Contains((Get-NormalizedPath -Path $item.FullName))) { continue }
+            $allDirs.Add($item.FullName)
+            $queue.Enqueue($item.FullName)
+        }
+    }
+
+    # 从深到浅删除：子目录删空后父目录才会显空
+    $sorted = @($allDirs.ToArray() | Sort-Object { $_.Split('\').Count } -Descending)
+
     $count = 0
-    foreach ($dir in $allDirs) {
-        $items = @(Get-ChildItem -LiteralPath $dir.FullName -Force -ErrorAction SilentlyContinue)
-        if ($items.Count -eq 0) {
-            try { Remove-Item -LiteralPath $dir.FullName -Force -ErrorAction Stop; $count++ } catch { }
+    foreach ($dir in $sorted) {
+        $isEmpty = $false
+        # 判空取首项短路即可；枚举器必须及时释放，否则目录句柄会挡住随后的删除
+        $enum = $null
+        try {
+            $enum = [System.IO.Directory]::EnumerateFileSystemEntries($dir).GetEnumerator()
+            $isEmpty = -not $enum.MoveNext()
+        } catch {
+        } finally {
+            if ($null -ne $enum) { $enum.Dispose() }
+        }
+        if ($isEmpty) {
+            try { Remove-Item -LiteralPath $dir -Force -ErrorAction Stop; $count++ } catch { }
         }
     }
     if ($count -gt 0) { Write-Host "  [OK] 清理了 $count 个空文件夹" -ForegroundColor Green }
