@@ -28,6 +28,9 @@
 # 保留所有源文件，并指定自定义工作目录
 .\FLYYZ_fixed.ps1 -WorkDir "D:\downloads\FLYYZ" -KeepFiles
 
+# SSD 上用 4 路并行解压加速大批量
+.\FLYYZ_fixed.ps1 -Parallel 4
+
 # DORO / PADIO 混合批量：先按文件名自动分类，再分别解压
 .\DORO_PADIO.ps1
 
@@ -59,12 +62,14 @@
 - `-WorkDir <路径>`：工作目录，默认是脚本所在目录。
 - `-KeepFiles`：保留所有源文件（默认整条链成功后删除源压缩包）。
 - `-Password <密码>`：覆盖默认密码（仅单来源脚本支持）。
+- `-Parallel <N>`：最多 N 个 WinRAR 同时解压（默认 1 = 串行）；落位与删除始终串行。SSD 建议 2-4，机械硬盘建议保持 1（并行寻道反而更慢）。
 
 🔧 `yejiang_split_steps_step3_mode.ps1` 是唯一的例外——运行前请编辑文件顶部的变量：
 
 - `$deleteFlag`（默认 `$true`）：是否在成功后删除源文件。
 - `$password`（默认 `"yejiang"`）。
 - `$step3Flatten`（默认 `$false`）：`$true` 时把最终内容全部扁平化到 `output\`，否则保留目录结构。
+- `$parallel`（默认 `1`）：最多 N 个 WinRAR 同时解压；落位与删除始终串行。
 
 ### 🎛️ 统一菜单 `extract.ps1`
 
@@ -141,6 +146,9 @@ Drop the `.mp4` / archive files into the script's directory, then run:
 # Keep all source files, specify a custom work directory
 .\FLYYZ_fixed.ps1 -WorkDir "D:\downloads\FLYYZ" -KeepFiles
 
+# Speed up large batches with 4 concurrent extractions (SSD)
+.\FLYYZ_fixed.ps1 -Parallel 4
+
 # Mixed DORO/PADIO batch: auto-classifies by file name before extracting
 .\DORO_PADIO.ps1
 
@@ -172,12 +180,14 @@ Except for `yejiang_split_steps_step3_mode.ps1`, every script is parameter-based
 - `-WorkDir <path>`: work directory, defaults to the script's location.
 - `-KeepFiles`: keep all source files (by default source archives are deleted after a chain fully succeeds).
 - `-Password <pw>`: override the default password (single-source scripts only).
+- `-Parallel <N>`: up to N concurrent WinRAR extractions (default 1 = serial); placement and deletion always stay serial. 2-4 recommended on SSDs; keep 1 on HDDs (parallel seeking is slower).
 
 🔧 `yejiang_split_steps_step3_mode.ps1` is the one exception — edit the variables at the top of the file before running:
 
 - `$deleteFlag` (default `$true`): whether to delete source files on success.
 - `$password` (default `"yejiang"`).
 - `$step3Flatten` (default `$false`): when `$true`, flatten all final content into `output\`; otherwise keep the directory structure.
+- `$parallel` (default `1`): up to N concurrent WinRAR extractions; placement and deletion always stay serial.
 
 ### 🎛️ Unified menu `extract.ps1`
 
