@@ -11,6 +11,8 @@
 .NOTES
     - 全部解压均使用 WinRAR，不依赖 7-Zip。
     - 退出码 0 但未解出任何内容（头加密 7z 遇错误密码的典型表现）一律按失败处理，避免误删。
+    - $parallel = N 可让最多 N 个 WinRAR 同时解压（1 = 串行）；落位与删除始终串行。
+      SSD 建议 2-4，机械硬盘建议保持 1（并行寻道反而更慢）。
 #>
 
 # ==================== 配置区（按需修改）====================
@@ -24,6 +26,10 @@ $password = "yejiang"
 #   $false：保留相对路径 + 压缩包名目录（保留目录结构）
 #   $true ：平铺到 output 根目录（不保留相对路径/压缩包名目录）
 $step3Flatten = $false
+
+# 并行解压数：最多 N 个 WinRAR 同时解压（1 = 串行；落位与删除始终串行）。
+# SSD 建议 2-4，机械硬盘建议保持 1（并行寻道反而更慢）。
+$parallel = 1
 # ==========================================================
 
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -48,6 +54,7 @@ if (-not $WinRarExe) {
     exit 1
 }
 Write-Host "[OK] 找到 WinRAR: $WinRarExe" -ForegroundColor Green
+if ($parallel -gt 1) { Write-Host "并行度: $parallel" -ForegroundColor Gray }
 Write-Host ""
 
 # ==================== 基础工具函数 ====================
@@ -305,67 +312,114 @@ function Remove-ArchiveGroup {
     }
 }
 
-# ==================== 解压（全部使用 WinRAR）====================
-function Invoke-WinRARExtract {
-    param([Parameter(Mandatory)][string]$ArchivePath, [Parameter(Mandatory)][string]$TargetDir)
+# ==================== 解压包装（全部使用 WinRAR）====================
+# 启动一个 WinRAR 解压进程（不等待）。返回任务句柄，由 Complete-WinRARExtract 收割。
+# WinRAR.exe 是 GUI 程序，必须等进程退出才能拿到真实退出码；-or = 同名自动改名兜底；-inul = 禁错误弹窗，防无人值守卡死。
+function Start-WinRARExtract {
+    param(
+        [Parameter(Mandatory)][string]$ArchivePath,
+        [Parameter(Mandatory)][string]$TargetDir,
+        [Parameter(Mandatory)][string]$ArchiveKey
+    )
 
     New-DirectoryIfMissing -Path $TargetDir
     $proc = Start-Process -FilePath $WinRarExe -ArgumentList @(
-        'x', "-p$password", '-ibck', '-inul', '-y', '-or',
-        "`"$ArchivePath`"", "`"$TargetDir\`""
-    ) -Wait -PassThru -NoNewWindow
+        'x',
+        "-p$ArchiveKey",
+        '-ibck',
+        '-inul',
+        '-y',
+        '-or',
+        "`"$ArchivePath`"",
+        "`"$TargetDir\`""
+    ) -PassThru -NoNewWindow
 
-    if ($null -eq $proc -or $proc.ExitCode -ne 0) { return $false }
+    return [pscustomobject]@{ Proc = $proc; ArchivePath = $ArchivePath; TargetDir = $TargetDir }
+}
 
-    # 头加密 7z 遇错误密码时退出码仍为 0 却什么都不解；追加校验避免误判成功而误删。
-    $extracted = @(Get-ChildItem -LiteralPath $TargetDir -Force -ErrorAction SilentlyContinue)
-    if ($extracted.Count -eq 0) {
-        Write-Host "  [FAIL] 退出码 0 但未解出任何文件（疑似密码错误或头加密包无法读取）" -ForegroundColor Red
+# 等待解压进程退出并校验结果（退出码 + 空解压防护）。
+function Complete-WinRARExtract {
+    param([Parameter(Mandatory)][pscustomobject]$ExtractJob)
+
+    $proc = $ExtractJob.Proc
+    if ($null -eq $proc) { return $false }
+    $proc.WaitForExit()
+
+    if ($proc.ExitCode -ne 0) {
+        # 数据加密档退出码可靠：7z 档=3，zip 档=10，rar 档=非 0
         return $false
     }
+
+    # 头加密 7z（-mhe=on）遇错误密码时 WinRAR 仍返回退出码 0 却什么都不解，
+    # 单看退出码会误判成功并误删源文件。故追加校验：必须真的解出了内容。
+    # 调用方传入的 TargetDir 是新建的隔离空目录，目录内任何条目都来自本次解压。
+    $extracted = @(Get-ChildItem -LiteralPath $ExtractJob.TargetDir -Force -ErrorAction SilentlyContinue)
+    if ($extracted.Count -eq 0) {
+        Write-Host "  [FAIL] 退出码 0 但未解出任何文件（疑似密码错误或头加密包无法读取）: $(Split-Path -Leaf $ExtractJob.ArchivePath)" -ForegroundColor Red
+        return $false
+    }
+
     return $true
 }
 
-# 命名解压：解到指定的（唯一化）目标目录，保留目录结构、隔离、不覆盖
-function Invoke-NamedExtraction {
-    param([Parameter(Mandatory)][pscustomobject]$Entry, [Parameter(Mandatory)][string]$TargetDir)
+# 批量解压调度：窗口内最多 ThrottleLimit 个 WinRAR 并发，结果严格按提交顺序收割。
+# ThrottleLimit=1 时退化为"启动→等待→下一个"，与逐个同步解压完全等价。
+# 任务对象需含 Entry / TargetDir / ArchiveKey（TargetDir 必须是调用方预创建的唯一隔离目录），
+# 返回 [{ Task; Success }]，顺序与输入一致。所有移动/删除等落位操作由调用方在收割后串行执行。
+function Invoke-ExtractionBatch {
+    param(
+        [object[]]$Tasks = @(),
+        [int]$ThrottleLimit = 1
+    )
 
-    $actualTarget = Get-UniqueDirectoryPath -DirectoryPath $TargetDir
-    if ($actualTarget -ne $TargetDir) {
-        Write-Host "  [RENAME] 目标目录已存在，改用: $(Split-Path -Leaf $actualTarget)" -ForegroundColor Yellow
+    if ($Tasks.Count -eq 0) { return @() }
+    $limit = [Math]::Max(1, $ThrottleLimit)
+    $results = New-Object 'System.Collections.Generic.List[object]'
+    $inFlight = New-Object 'System.Collections.Generic.Queue[object]'
+
+    foreach ($task in $Tasks) {
+        while ($inFlight.Count -ge $limit) {
+            $oldest = $inFlight.Dequeue()
+            $ok = Complete-WinRARExtract -ExtractJob $oldest.ExtractJob
+            $results.Add([pscustomobject]@{ Task = $oldest.Task; Success = $ok })
+        }
+        Write-Host "[EXTRACT] ($(Get-EntryLabel -Entry $task.Entry)) $(Split-Path -Leaf $task.Entry.Path) -> $($task.TargetDir)" -ForegroundColor Yellow
+        $extractJob = Start-WinRARExtract -ArchivePath $task.Entry.Path -TargetDir $task.TargetDir -ArchiveKey $task.ArchiveKey
+        $inFlight.Enqueue([pscustomobject]@{ Task = $task; ExtractJob = $extractJob })
     }
-    New-DirectoryIfMissing -Path $actualTarget
-    Write-Host "[EXTRACT] ($(Get-EntryLabel -Entry $Entry)) $(Split-Path -Leaf $Entry.Path) -> $actualTarget" -ForegroundColor Yellow
-    $success = Invoke-WinRARExtract -ArchivePath $Entry.Path -TargetDir $actualTarget
-    return [pscustomobject]@{ Success = $success; TargetDir = $actualTarget }
+    while ($inFlight.Count -gt 0) {
+        $oldest = $inFlight.Dequeue()
+        $ok = Complete-WinRARExtract -ExtractJob $oldest.ExtractJob
+        $results.Add([pscustomobject]@{ Task = $oldest.Task; Success = $ok })
+    }
+
+    return $results.ToArray()
 }
 
-# 平铺解压：先解到隔离临时目录（带校验），成功后并入 output 根，冲突改名不覆盖
-function Expand-ArchiveFlatten {
-    param([Parameter(Mandatory)][pscustomobject]$Entry, [Parameter(Mandatory)][string]$OutputDir)
+# 落位（串行）：把隔离临时目录的全部内容移入目标目录，条目冲突时把既有项改名让位。
+function Move-ExtractedContentIntoDir {
+    param(
+        [Parameter(Mandatory)][string]$TmpDir,
+        [Parameter(Mandatory)][string]$TargetDir
+    )
 
-    New-DirectoryIfMissing -Path $OutputDir
-    $tmp = Get-UniqueDirectoryPath -DirectoryPath (Join-Path $OutputDir (".__unpack_" + (Get-SafeFolderName -Name $Entry.Base)))
-    New-DirectoryIfMissing -Path $tmp
-    Write-Host "[EXTRACT] ($(Get-EntryLabel -Entry $Entry)) $(Split-Path -Leaf $Entry.Path) -> $OutputDir (平铺)" -ForegroundColor Yellow
-    $success = Invoke-WinRARExtract -ArchivePath $Entry.Path -TargetDir $tmp
-
-    if (-not $success) {
-        if (Test-Path -LiteralPath $tmp) {
-            $leftover = @(Get-ChildItem -LiteralPath $tmp -Force -ErrorAction SilentlyContinue)
-            if ($leftover.Count -eq 0) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
-            else { Write-Host "  [KEEP] 解压失败，保留临时目录: $(Split-Path -Leaf $tmp)" -ForegroundColor Yellow }
-        }
-        return $false
-    }
-
-    foreach ($item in @(Get-ChildItem -LiteralPath $tmp -Force -ErrorAction SilentlyContinue)) {
-        $dest = Join-Path $OutputDir $item.Name
+    New-DirectoryIfMissing -Path $TargetDir
+    foreach ($item in @(Get-ChildItem -LiteralPath $TmpDir -Force -ErrorAction SilentlyContinue)) {
+        $dest = Join-Path $TargetDir $item.Name
         if (Test-Path -LiteralPath $dest) { [void](Move-ExistingPathAside -Path $dest) }
         Move-Item -LiteralPath $item.FullName -Destination $dest -ErrorAction Stop
     }
-    Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
-    return $true
+    Remove-Item -LiteralPath $TmpDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# 解压失败的隔离临时目录：空则删除，有残留则保留供排查。
+function Remove-FailedExtractionTemp {
+    param([Parameter(Mandatory)][string]$TmpDir)
+
+    if (-not (Test-Path -LiteralPath $TmpDir)) { return }
+    $leftover = @(Get-ChildItem -LiteralPath $TmpDir -Force -ErrorAction SilentlyContinue)
+    if ($leftover.Count -eq 0) { Remove-Item -LiteralPath $TmpDir -Force -ErrorAction SilentlyContinue }
+    else { Write-Host "  [KEEP] 解压失败，保留临时目录: $(Split-Path -Leaf $TmpDir)" -ForegroundColor Yellow }
 }
 
 function Remove-EmptyDirs {
@@ -445,56 +499,101 @@ Write-Host "[STEP 2/3] 逐链解压（Step3 模式：$modeText）" -ForegroundCo
 Write-Host "----------------------------------------"
 
 $chains = @()
+$step2Tasks = @()
 foreach ($source in $sources) {
     $chain = [pscustomobject]@{
         Name           = $source.Base
         Success        = $false
+        HasStep3Tasks  = $false
+        FailedCount    = 0
         FailedStage    = ""
+        Stage2Dir      = $null
         CleanupEntries = @($source)
     }
 
-    # Step 2: 源 -> output0\<相对路径>\<压缩包名>\（隔离）
+    # Step 2: 源 -> output0\<相对路径>\<压缩包名>\（隔离，串行预分配唯一目录）
     $relDir = Get-RelativeDirectory -RootDir $scriptDir -ChildDir $source.Dir
     $stage2Base = if ($relDir) { Join-Path (Join-Path $Output0 $relDir) (Get-SafeFolderName -Name $source.Base) } else { Join-Path $Output0 (Get-SafeFolderName -Name $source.Base) }
     Write-Host "[CHAIN] $($source.Base)" -ForegroundColor Cyan
-    $r2 = Invoke-NamedExtraction -Entry $source -TargetDir $stage2Base
-    if (-not $r2.Success) {
-        $chain.FailedStage = "Step2"
-        Write-Host "[CHAIN FAIL] $($source.Base): Step2（源文件保留）" -ForegroundColor Red
-        $chains += $chain
-        Write-Host ""
+    $stage2Dir = Get-UniqueDirectoryPath -DirectoryPath $stage2Base
+    if ($stage2Dir -ne $stage2Base) {
+        Write-Host "  [RENAME] 目标目录已存在，改用: $(Split-Path -Leaf $stage2Dir)" -ForegroundColor Yellow
+    }
+    New-DirectoryIfMissing -Path $stage2Dir
+    $chain.Stage2Dir = $stage2Dir
+    $step2Tasks += [pscustomobject]@{ Entry = $source; TargetDir = $stage2Dir; ArchiveKey = $password; Chain = $chain }
+    $chains += $chain
+}
+
+foreach ($r in @(Invoke-ExtractionBatch -Tasks $step2Tasks -ThrottleLimit $parallel)) {
+    $leaf = Split-Path -Leaf $r.Task.Entry.Path
+    if ($r.Success) { Write-Host "  [OK] Step2 完成: $leaf" -ForegroundColor Green }
+    else {
+        $r.Task.Chain.FailedStage = "Step2"
+        Write-Host "  [FAIL] Step2 失败: $leaf" -ForegroundColor Red
+    }
+}
+Write-Host ""
+
+# Step 3: 各成功链 output0 子树内的压缩包 -> output（平铺 / 保留结构）
+$step3Tasks = @()
+foreach ($chain in $chains) {
+    if ($chain.FailedStage) { continue }
+    $step3Entries = @(Get-ArchiveEntrypoints -RootDir $chain.Stage2Dir)
+    if ($step3Entries.Count -eq 0) {
+        Write-Host "[STEP3] $($chain.Name): 未发现可解压的中间压缩包" -ForegroundColor Yellow
         continue
     }
-
-    # Step 3: 该源 output0 子树内的压缩包 -> output（平铺 / 保留结构）
-    $step3Entries = @(Get-ArchiveEntrypoints -RootDir $r2.TargetDir)
-    $allOk = $step3Entries.Count -gt 0
-    if ($step3Entries.Count -eq 0) {
-        Write-Host "[STEP3] 未发现可解压的中间压缩包" -ForegroundColor Yellow
-    }
+    $chain.HasStep3Tasks = $true
     foreach ($a in $step3Entries) {
         $chain.CleanupEntries = @($chain.CleanupEntries + $a)
         if ($step3Flatten) {
-            $ok = Expand-ArchiveFlatten -Entry $a -OutputDir $Output
+            New-DirectoryIfMissing -Path $Output
+            $tmp = Get-UniqueDirectoryPath -DirectoryPath (Join-Path $Output (".__unpack_" + (Get-SafeFolderName -Name $a.Base)))
+            New-DirectoryIfMissing -Path $tmp
+            $step3Tasks += [pscustomobject]@{ Entry = $a; TargetDir = $tmp; ArchiveKey = $password; Chain = $chain; Kind = 'flatten' }
         } else {
             $relDir2 = Get-RelativeDirectory -RootDir $Output0 -ChildDir $a.Dir
-            $target = if ($relDir2) { Join-Path (Join-Path $Output $relDir2) (Get-SafeFolderName -Name $a.Base) } else { Join-Path $Output (Get-SafeFolderName -Name $a.Base) }
-            $r3 = Invoke-NamedExtraction -Entry $a -TargetDir $target
-            $ok = $r3.Success
+            $desired = if ($relDir2) { Join-Path (Join-Path $Output $relDir2) (Get-SafeFolderName -Name $a.Base) } else { Join-Path $Output (Get-SafeFolderName -Name $a.Base) }
+            $target = Get-UniqueDirectoryPath -DirectoryPath $desired
+            if ($target -ne $desired) {
+                Write-Host "  [RENAME] 目标目录已存在，改用: $(Split-Path -Leaf $target)" -ForegroundColor Yellow
+            }
+            New-DirectoryIfMissing -Path $target
+            $step3Tasks += [pscustomobject]@{ Entry = $a; TargetDir = $target; ArchiveKey = $password; Chain = $chain; Kind = 'named' }
         }
-        if (-not $ok) { $allOk = $false }
     }
+}
 
-    $chain.Success = $allOk
+foreach ($r in @(Invoke-ExtractionBatch -Tasks $step3Tasks -ThrottleLimit $parallel)) {
+    $chain = $r.Task.Chain
+    $leaf = Split-Path -Leaf $r.Task.Entry.Path
+    if ($r.Task.Kind -eq 'flatten') {
+        if ($r.Success) { Move-ExtractedContentIntoDir -TmpDir $r.Task.TargetDir -TargetDir $Output }
+        else { Remove-FailedExtractionTemp -TmpDir $r.Task.TargetDir }
+    }
+    if ($r.Success) { Write-Host "  [OK] Step3 完成: $leaf" -ForegroundColor Green }
+    else {
+        $chain.FailedCount++
+        Write-Host "  [FAIL] Step3 失败: $leaf" -ForegroundColor Red
+    }
+}
+
+Write-Host ""
+foreach ($chain in $chains) {
+    if ($chain.FailedStage -eq "Step2") {
+        Write-Host "[CHAIN FAIL] $($chain.Name): Step2（源文件保留）" -ForegroundColor Red
+        continue
+    }
+    $chain.Success = $chain.HasStep3Tasks -and ($chain.FailedCount -eq 0)
     if ($chain.Success) {
-        Write-Host "[CHAIN OK] $($source.Base)" -ForegroundColor Green
+        Write-Host "[CHAIN OK] $($chain.Name)" -ForegroundColor Green
     } else {
         $chain.FailedStage = "Step3"
-        Write-Host "[CHAIN FAIL] $($source.Base): Step3（源文件保留）" -ForegroundColor Red
+        Write-Host "[CHAIN FAIL] $($chain.Name): Step3（源文件保留）" -ForegroundColor Red
     }
-    $chains += $chain
-    Write-Host ""
 }
+Write-Host ""
 
 # ==================== 清理：只删除完整成功链 ====================
 if ($deleteFlag) {
